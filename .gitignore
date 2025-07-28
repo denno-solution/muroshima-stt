@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+
+# Application settings
+.app_settings.json
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+audio_transcriptions.db
+
+# Logs
+logs/
+*.log
+
+# Audio data and transcriptions
+data/
+transcriptions/
