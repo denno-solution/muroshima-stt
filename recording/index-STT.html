@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>録音アプリ – 外部マイク優先版</title>
+  <style>
+    :root{
+      --accent:#2196f3;
+      --safe:#43a047;
+      --danger:#e53935;
+      --bg:#f0f0f0;
+    }
+    html,body{margin:0;padding:0;height:100%;display:flex;flex-direction:column;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);}
+
+    /*───────── チャット & ステータス ─────────*/
+    #chat{flex:1;overflow-y:auto;padding:10px;}
+    .message{margin:8px 10px;padding:10px;background:#d0f0ff;border-radius:10px;}
+    #statusArea{background:#fff8dc;font-size:.85rem;color:#555;padding:8px 10px;border-top:1px solid #ccc;max-height:80px;overflow-y:auto;}
+    #errorStatus{background:#ffe5e5;color:#b00020;font-size:.9rem;padding:8px 10px;text-align:center;border-top:1px solid #ccc;display:none;}
+
+    /*───────── マイク UI ─────────*/
+    #micContainer{padding:8px 10px;}
+    .mic-controls{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;}
+    #micSelect{flex:1;font-size:1rem;padding:5px;min-width:140px;}
+    #refreshMicBtn{padding:5px 10px;background:#4caf50;color:#fff;border:none;border-radius:4px;cursor:pointer;}
+
+    .volume-meter{margin-bottom:10px;}
+    .volume-bar{width:100%;height:10px;background:#ddd;border-radius:5px;overflow:hidden;}
+    .volume-fill{height:100%;background:linear-gradient(to right,#4caf50,#ffc107,#f44336);width:0%;transition:width .1s ease;}
+
+    .connection-status{display:flex;align-items:center;gap:5px;font-size:.9rem;color:#666;}
+    .connection-status.connected{color:#4caf50;}
+    .connection-status.disconnected{color:#f44336;}
+
+    /*───────── フッター ─────────*/
+    footer{padding:12px 8px;background:#fff;border-top:1px solid #ccc;display:flex;align-items:center;gap:18px;justify-content:center;flex-wrap:wrap;}
+    #waveCanvas{width:180px;height:60px;background:#000;border-radius:6px;}
+    #led{width:28px;height:28px;border-radius:50%;background:gray;flex-shrink:0;}
+    #led.active{background:var(--accent);box-shadow:0 0 8px var(--accent);transform:scale(1.4);}
+    #recordBtn{padding:32px 80px;font-size:1.35rem;border:none;border-radius:44px;background:var(--safe);color:#fff;display:flex;align-items:center;gap:.5em;}
+    #recordBtn.recording{background:var(--danger);}  
+    @media(min-width:640px){#recordBtn{padding:28px 60px;font-size:1.25rem;}}
+  </style>
+</head>
+<body>
+  <div id="chat"></div>
+  <div id="statusArea"></div>
+  <div id="errorStatus"></div>
+
+  <!-- マイク選択＆レベル表示 -->
+  <div id="micContainer">
+    <div class="mic-controls">
+      <label for="micSelect">🎤 マイク選択:</label>
+      <select id="micSelect"><option>読み込み中...</option></select>
+      <button id="refreshMicBtn" onclick="refreshMicrophones()">🔄</button>
+    </div>
+    <div class="volume-meter">
+      <label>音声レベル:</label>
+      <div class="volume-bar"><div id="volumeIndicator" class="volume-fill"></div></div>
+    </div>
+    <div id="connectionStatus" class="connection-status"><span id="connectionIcon">🔌</span><span id="connectionText">マイク未接続</span></div>
+  </div>
+
+  <footer>
+    <canvas id="waveCanvas"></canvas>
+    <div id="led"></div>
+    <button id="recordBtn" onclick="toggleRecording()"><span id="recordLabel">🎙️ 録音スタート</span></button>
+  </footer>
+
+<script>
+/*************** グローバル変数 ****************/  
+let isRecording=false, recorder=null, bufferQueue=[];
+let audioContext, analyser, processor, mediaStream;
+let recordingIndex=0, activeDetected=false, silenceStart=null;
+const silenceThreshold=0.01, silenceDuration=4000, maxRecordingDuration=55000, maxBuffers=3;
+let wakeLock=null;
+
+/*************** Wake Lock ***************/
+async function requestWakeLock(){try{if('wakeLock'in navigator){wakeLock=await navigator.wakeLock.request('screen');wakeLock.addEventListener('release',()=>console.log('🔋 WakeLock released'));}}catch(e){console.warn('WakeLock取得失敗',e);}}
+function releaseWakeLock(){if(wakeLock){wakeLock.release();wakeLock=null;}}
+
+/*************** Microphone Manager ***************/
+class MicrophoneManager{
+  constructor(){this.currentStream=null;this.selectedDeviceId='';}
+  async initialize(){await this.initMicList();navigator.mediaDevices.ondevicechange=()=>{console.log('🔄 devicechange');setTimeout(()=>this.initMicList(),1000);} }
+  async initMicList(){try{const tmp=await navigator.mediaDevices.getUserMedia({audio:true});tmp.getTracks().forEach(t=>t.stop());await new Promise(r=>setTimeout(r,500));const devs=await navigator.mediaDevices.enumerateDevices();const sel=document.getElementById('micSelect');sel.innerHTML='';const inputs=devs.filter(d=>d.kind==='audioinput');const patterns=[/external/i,/headset/i,/bluetooth/i,/usb/i,/rode/i,/wireless/i];let external=null;for(const d of inputs){if(d.label){for(const p of patterns){if(p.test(d.label)){external=d;break;}}if(external)break;}}
+      inputs.forEach((d,i)=>{const o=document.createElement('option');o.value=d.deviceId;let label=d.label||`マイク-${i+1}`;if(d===external)label=`🎤 ${label} (外部マイク)`;o.textContent=label;sel.appendChild(o);});
+      if(external){sel.value=external.deviceId;this.selectedDeviceId=external.deviceId;updateConnectionStatus(true,external.label);}else if(inputs[0]){updateConnectionStatus(true,inputs[0].label);}else{updateConnectionStatus(false);}  
+  }catch(e){console.warn('マイクリスト失敗',e);updateConnectionStatus(false);}}
+  async getStream(){if(this.currentStream){this.currentStream.getTracks().forEach(t=>t.stop());}
+    const id=this.selectedDeviceId||document.getElementById('micSelect').value;
+    const cons=id?{audio:{deviceId:{exact:id},echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:16000,channelCount:1}}: {audio:true};
+    try{this.currentStream=await navigator.mediaDevices.getUserMedia(cons);
+      const tr=this.currentStream.getAudioTracks()[0];console.log('🎤 使用中:',tr.label,tr.getSettings());updateConnectionStatus(true,tr.label);
+      tr.addEventListener('ended',()=>{console.log('🔌 マイク切断');updateConnectionStatus(false);showErr('マイクが切断されました');});
+      return this.currentStream;
+    }catch(e){console.error('getStream失敗',e);updateConnectionStatus(false);throw e;}}
+}
+const micManager=new MicrophoneManager();
+
+/*************** UI ヘルパー ***************/
+function appendMessage(t){const m=document.createElement('div');m.className='message';m.textContent=t;const c=document.getElementById('chat');c.appendChild(m);c.scrollTop=c.scrollHeight;}
+function setStatus(t){const d=document.createElement('div');d.textContent=t;const s=document.getElementById('statusArea');s.appendChild(d);s.scrollTop=s.scrollHeight;}
+function showErr(t){const e=document.getElementById('errorStatus');e.textContent=t;e.style.display='block';setTimeout(()=>e.style.display='none',6000);}  
+function updateConnectionStatus(on,label=''){const st=document.getElementById('connectionStatus');const ic=document.getElementById('connectionIcon');const tx=document.getElementById('connectionText');if(on){st.className='connection-status connected';ic.textContent='🎤';tx.textContent=`接続中: ${label}`;}else{st.className='connection-status disconnected';ic.textContent='🔌';tx.textContent='マイク未接続';}}
+
+/*************** 波形描画 ***************/
+let waveCtx, waveCanvas;function startWaveVisual(){waveCanvas=document.getElementById('waveCanvas');waveCtx=waveCanvas.getContext('2d');const draw=()=>{if(!analyser)return;const buf=new Uint8Array(analyser.fftSize);analyser.getByteTimeDomainData(buf);waveCtx.fillStyle='#000';waveCtx.fillRect(0,0,waveCanvas.width,waveCanvas.height);waveCtx.lineWidth=2;waveCtx.strokeStyle='#0f0';waveCtx.beginPath();const slice=waveCanvas.width/buf.length;let x=0;for(let i=0;i<buf.length;i++){const v=buf[i]/128.0;const y=v*waveCanvas.height/2; if(i===0)waveCtx.moveTo(x,y);else waveCtx.lineTo(x,y); x+=slice;}waveCtx.lineTo(waveCanvas.width,waveCanvas.height/2);waveCtx.stroke();requestAnimationFrame(draw);};draw();}
+
+/*************** 音声レベル表示 ***************/
+function monitorAudioLevel(){if(!analyser)return;const vol=document.getElementById('volumeIndicator');const data=new Float32Array(analyser.fftSize);const loop=()=>{if(!isRecording)return;analyser.getFloatTimeDomainData(data);const rms=Math.sqrt(data.reduce((s,v)=>s+v*v,0)/data.length);vol.style.width=`${Math.min(rms*300,100)}%`;requestAnimationFrame(loop);} ;loop();}
+
+/*************** 録音バッファリング ***************/
+async function startBuffering(){try{mediaStream=await micManager.getStream(); audioContext=new AudioContext(); const src=audioContext.createMediaStreamSource(mediaStream); analyser=audioContext.createAnalyser(); analyser.fftSize=1024; processor=audioContext.createScriptProcessor(2048,1,1); src.connect(analyser);src.connect(processor);processor.connect(audioContext.destination); const bufferLength=50;bufferQueue=[];processor.onaudioprocess=e=>{const input=e.inputBuffer.getChannelData(0);if(bufferQueue.length>=bufferLength)bufferQueue.shift();bufferQueue.push(new Float32Array(input));}; startWaveVisual(); monitorAudioLevel(); }catch(e){showErr('マイク初期化失敗:'+e.message); throw e;}}
+function getBufferedAudio(){const len=bufferQueue.reduce((s,c)=>s+c.length,0);const out=new Float32Array(len);let off=0;for(const c of bufferQueue){out.set(c,off);off+=c.length;}return out;}
+
+/*************** 録音ループ ***************/
+async function recordOne(){recorder=new MediaRecorder(mediaStream);let chunks=[];activeDetected=false;let t0=Date.now();recorder.ondataavailable=e=>chunks.push(e.data);recorder.start();const ana=analyser;const data=new Float32Array(ana.fftSize);return new Promise(res=>{const chk=()=>{if(!isRecording||recorder.state!=='recording')return res();ana.getFloatTimeDomainData(data);const rms=Math.sqrt(data.reduce((s,v)=>s+v*v,0)/data.length);document.getElementById('led').classList.toggle('active',rms>silenceThreshold);if(rms>silenceThreshold){activeDetected=true;silenceStart=null;}else{if(!silenceStart)silenceStart=Date.now();if(Date.now()-silenceStart>silenceDuration){recorder.stop();silenceStart=null;}}
+      if(Date.now()-t0>=maxRecordingDuration){recorder.stop();silenceStart=null;}else requestAnimationFrame(chk);
+    };
+    recorder.onstop=async()=>{
+      if(!activeDetected){setStatus(`🛑 無音録音: buffer${recordingIndex} → スキップ`);return res();}
+      const blob=new Blob(chunks,{type:'audio/webm'});
+      setStatus(`🛑 録音完了 buffer${recordingIndex} ${(blob.size/1024).toFixed(1)} KB`);
+      const fd=new FormData();fd.append('audio',blob,`buffer${recordingIndex}.webm`);
+      try{const r=await fetch('https://http-stt-webhook-120372565924.asia-northeast1.run.app/webhook',{method:'POST',body:fd});const j=await r.json();if(j.text&&j.text!=='音声が認識できませんでした。'){appendMessage(j.text);}else if(j.text) showErr(j.text);}catch(e){console.error('送信エラー',e);} recordingIndex=(recordingIndex+1)%maxBuffers;res();}; requestAnimationFrame(chk);});}
+async function loop(){while(isRecording){await recordOne();await new Promise(r=>setTimeout(r,200));}}
+
+/*************** 録音トグル ***************/
+async function toggleRecording(){const btn=document.getElementById('recordBtn');isRecording=!isRecording;document.getElementById('recordLabel').textContent=isRecording?'⏹️ 録音停止':'🎙️ 録音スタート';btn.classList.toggle('recording');if(isRecording){await startBuffering();requestWakeLock();loop();}else stopAll();}
+function stopAll(){releaseWakeLock();if(recorder&&recorder.state!=='inactive')recorder.stop();if(processor)processor.disconnect();if(audioContext)audioContext.close();if(mediaStream)mediaStream.getTracks().forEach(t=>t.stop());document.getElementById('led').classList.remove('active');appendMessage('⏹️ 録音停止');document.getElementById('statusArea').textContent='';}
+
+/*************** マイク選択 & リフレッシュ ***************/
+async function handleMicrophoneChange(){const sel=document.getElementById('micSelect');micManager.selectedDeviceId=sel.value;updateConnectionStatus(true,sel.options[sel.selectedIndex]?.textContent||''); if(isRecording){if(confirm('録音中です。マイクを変更しますか？録音は一時停止されます')){toggleRecording();}}}
+async function refreshMicrophones(){const btn=document.getElementById('refreshMicBtn');btn.disabled=true;await micManager.initMicList();btn.disabled=false;}
+
+document.getElementById('micSelect').addEventListener('change',handleMicrophoneChange);
+
+/*************** 初期化 ***************/
+window.addEventListener('DOMContentLoaded',async()=>{await micManager.initialize();console.log('✅ MicManager init');});
+</script>
+</body>
+</html>
