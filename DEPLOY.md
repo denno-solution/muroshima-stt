@@ -4,9 +4,15 @@
 
 1. **GitHub リポジトリ**にコードをプッシュ
 2. **PostgreSQL データベース**を準備（以下のいずれか）：
-   - [Supabase](https://supabase.com) - 無料プランあり
+   - [Supabase](https://supabase.com) - 無料プランあり ← 選択済み！
    - [Neon](https://neon.tech) - 無料プランあり
    - [Render PostgreSQL](https://render.com/docs/databases)
+
+### Supabaseセットアップ手順
+1. `create_tables.sql`の内容をSupabaseのSQL Editorで実行
+2. Settings → Database → Connection stringからURLをコピー
+3. .envファイルのDATABASE_URLを更新
+4. `python test_db_connection.py`で接続テスト
 
 ## デプロイ手順
 
