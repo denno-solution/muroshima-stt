@@ -9,7 +9,7 @@ from openai import OpenAI
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     # 環境変数が設定されていない場合は、ここにAPIキーを設定
-    api_key = "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"
+    api_key = "aaa"
     print("警告: APIキーがハードコードされています。環境変数OPENAI_API_KEYの使用を推奨します。")
 
 client = OpenAI(api_key=api_key)
@@ -26,7 +26,7 @@ def transcribe_audio_file(audio_file_path):
                     language="ja",  # 日本語を明示的に指定
                     prompt="これは工場での機械設定に関する音声です。数値、温度、時間、速度などのパラメータ変更を正確に記録してください。"  # プロンプトを追加
                 )
-                
+
                 # 結果をチェック（繰り返しパターンの検出）
                 text = transcription.text
                 words = text.split("、")
@@ -34,14 +34,14 @@ def transcribe_audio_file(audio_file_path):
                     # 最初の10語をチェック
                     first_word = words[0]
                     repetition_count = sum(1 for word in words[:10] if word == first_word)
-                    
+
                     # 80%以上が同じ単語の場合は問題ありと判断
                     if repetition_count >= 8:
                         print(f"  警告: 繰り返しパターンを検出しました。whisper-1にフォールバック...")
                         raise Exception("Repetitive pattern detected")
-                
+
                 return text
-                
+
             except Exception as e:
                 print(f"  gpt-4o-transcribeでエラー: {e}")
                 # 2. whisper-1にフォールバック
@@ -53,7 +53,7 @@ def transcribe_audio_file(audio_file_path):
                     language="ja"
                 )
                 return transcription.text
-                
+
     except Exception as e:
         print(f"エラー: {audio_file_path} の処理中にエラーが発生しました: {e}")
         return None
@@ -103,7 +103,7 @@ def process_all_audio_files():
         if transcription:
             # どのモデルが使用されたかを判定
             model_used = "gpt-4o-transcribe or whisper-1"
-            
+
             # 個別のテキストファイルとして保存
             output_path = save_transcription(audio_file.name, transcription, output_dir, model_used)
             print(f"  → 保存完了: {output_path}")

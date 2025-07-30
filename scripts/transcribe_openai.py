@@ -9,7 +9,7 @@ from openai import OpenAI
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     # 環境変数が設定されていない場合は、ここにAPIキーを設定
-    api_key = "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"
+    api_key = "aaa"
     print("警告: APIキーがハードコードされています。環境変数OPENAI_API_KEYの使用を推奨します。")
 
 client = OpenAI(api_key=api_key)
