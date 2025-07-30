@@ -44,6 +44,10 @@ AWS_ACCESS_KEY_ID = "..."
 AWS_SECRET_ACCESS_KEY = "..."
 AZURE_SPEECH_KEY = "..."
 AZURE_SPEECH_REGION = "..."
+
+# Basic認証（オプション）
+BASIC_AUTH_USERNAME = "admin"
+BASIC_AUTH_PASSWORD = "your-secure-password"
 ```
 
 ### 4. デプロイ完了

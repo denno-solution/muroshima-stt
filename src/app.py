@@ -18,6 +18,7 @@ from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
 from app_settings import AppSettings
+from auth import check_password, logout
 
 # ロガーの設定
 logger = logging.getLogger(__name__)
@@ -49,6 +50,10 @@ check_env_changes()
 
 # アプリ設定の初期化
 settings = AppSettings()
+
+# Basic認証チェック
+if not check_password():
+    st.stop()
 
 # タイトル
 st.title("🎙️ 音声文字起こしWebアプリ")
@@ -161,6 +166,13 @@ with st.sidebar:
     
     # 環境変数の状態表示
     display_env_status(sidebar=True)
+    
+    # ログアウトボタン（Basic認証が有効な場合のみ表示）
+    if os.getenv("BASIC_AUTH_USERNAME") and os.getenv("BASIC_AUTH_PASSWORD"):
+        st.divider()
+        if st.button("🚪 ログアウト", type="secondary", use_container_width=True):
+            logout()
+            st.rerun()
 
 # メインエリア
 tab1, tab2, tab3 = st.tabs(["📤 アップロード", "📊 処理結果", "🗄️ データベース"])

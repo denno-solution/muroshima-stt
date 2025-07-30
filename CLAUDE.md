@@ -9,6 +9,7 @@ Streamlitを使用した音声文字起こしWebアプリケーションです�
 - Gemini Flash 2.5-liteによる文字起こしテキストの自動構造化（thinking mode + structured output対応）
 - SQLiteデータベースへの結果保存
 - 処理結果の閲覧と検索
+- Basic認証によるアクセス制限（オプション）
 
 ## クイックスタート
 
@@ -27,6 +28,17 @@ uv sync
 # .envファイルを編集
 # 最低限、使いたいSTTモデルのAPIキーを設定
 nano .env
+```
+
+#### データベースのセットアップ
+本アプリは**PostgreSQL**（Supabase）を使用します。ローカル開発用のSQLiteも利用可能です。
+
+##### Supabaseを使用する場合（推奨）
+1. [Supabase](https://supabase.com)でプロジェクトを作成
+2. `database/SUPABASE_SETUP.md`の手順に従ってテーブルを作成
+3. `.env`ファイルにDATABASE_URLを設定：
+```env
+DATABASE_URL=postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
 ```
 
 ### 2. 必要なAPIキー
@@ -71,8 +83,18 @@ nano .env  # またはお好みのエディタを使用
 #### サンプル.env設定（OpenAIを使う場合）
 
 ```env
+# データベース（Supabase使用時）
+DATABASE_URL=postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
+
+# STTモデル
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxx
+
+# 構造化機能用
 GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxx
+
+# Basic認証（オプション）
+BASIC_AUTH_USERNAME=admin
+BASIC_AUTH_PASSWORD=your-secure-password
 ```
 
 #### 環境変数を直接設定する方法
@@ -145,18 +167,39 @@ uv run streamlit run src/app.py
 
 設定は`.app_settings.json`ファイルに保存されます（gitignore対象）。
 
+### Basic認証
+
+アプリへのアクセスを制限するためのBasic認証機能を搭載しています：
+
+- **設定方法**: 環境変数に`BASIC_AUTH_USERNAME`と`BASIC_AUTH_PASSWORD`を設定
+- **動作**: 両方の環境変数が設定されている場合のみ認証が有効化されます
+- **ログアウト**: サイドバーにログアウトボタンが表示されます
+
+```env
+# Basic認証を有効化する場合
+BASIC_AUTH_USERNAME=admin
+BASIC_AUTH_PASSWORD=your-secure-password
+```
+
+注意: 本番環境では強力なパスワードを設定してください。
+
 ## データベーススキーマ
+
+### PostgreSQL（Supabase）
 
 | カラム名 | 型 | 説明 |
 |---------|-----|------|
-| 音声ID | Integer | 主キー（自動採番） |
-| 音声ファイルpath | String | ファイル名 |
-| 発言人数 | Integer | 発言者数（デフォルト: 1） |
-| 録音時刻 | DateTime | 処理時刻 |
-| 録音時間 | Float | 音声の長さ（秒） |
-| 文字起こしテキスト | Text | 文字起こし結果 |
-| 構造化データ | JSON | Geminiによる構造化データ |
-| タグ | String | 自動生成されたタグ |
+| 音声ID | SERIAL | 主キー（自動採番） |
+| 音声ファイルpath | VARCHAR(500) | ファイル名 |
+| 発言人数 | INTEGER | 発言者数（デフォルト: 1） |
+| 録音時刻 | TIMESTAMP | 処理時刻 |
+| 録音時間 | FLOAT | 音声の長さ（秒） |
+| 文字起こしテキスト | TEXT | 文字起こし結果 |
+| 構造化データ | JSONB | Geminiによる構造化データ |
+| タグ | VARCHAR(200) | 自動生成されたタグ |
+
+### データベース切り替え
+環境変数`DATABASE_URL`が設定されている場合は自動的にPostgreSQLを使用します。設定されていない場合はローカルのSQLiteを使用します。
 
 ## 対応ファイル形式
 
@@ -241,21 +284,34 @@ stt/
 │   ├── stt_wrapper.py     # STTモデルの統一インターフェース
 │   ├── text_structurer.py # Geminiによる構造化処理
 │   ├── env_watcher.py     # 環境変数の自動リロード機能
-│   └── app_settings.py    # アプリ設定の永続化
+│   ├── app_settings.py    # アプリ設定の永続化
+│   └── auth.py            # Basic認証機能
 ├── scripts/               # 各STTモデルの実装スクリプト
 │   ├── transcribe_openai.py
 │   ├── transcribe_google.py
 │   ├── transcribe_amazon.py
 │   ├── transcribe_azure.py
 │   └── transcribe_elevenlabs.py
+├── database/              # データベース関連
+│   ├── create_tables.sql  # テーブル作成SQL
+│   ├── SUPABASE_SETUP.md  # Supabaseセットアップ手順
+│   └── test_db_connection.py # DB接続テストスクリプト
+├── recording/             # 音声録音Webアプリ
+│   ├── index-STT.html     # 録音UI
+│   ├── index.js           # Node.js Webhookサーバー
+│   └── package.json       # 依存関係
 ├── data/                  # 音声ファイル置き場
 ├── transcriptions/        # 文字起こし結果
 ├── logs/                  # ログファイル（gitignore対象）
+├── .streamlit/            # Streamlit設定
+│   ├── config.toml        # アプリ設定
+│   └── secrets.toml.example # 秘密情報設定例
 ├── .env                   # 環境変数設定（gitignore対象）
 ├── .env.example           # 環境変数設定のサンプル
 ├── .app_settings.json     # アプリ設定（gitignore対象）
 ├── pyproject.toml         # プロジェクト設定と依存関係
 ├── run_app.sh            # アプリ起動スクリプト
+├── DEPLOY.md              # デプロイ手順書
 └── CLAUDE.md             # このドキュメント
 ```
 
@@ -306,3 +362,44 @@ python scripts/transcribe_elevenlabs.py
 # すべてのサービスを一括実行
 python transcribe_all.py
 ```
+
+## デプロイ
+
+### Streamlit Cloudへのデプロイ
+
+詳細は`DEPLOY.md`を参照してください。主な手順：
+
+1. **Supabaseでデータベースを準備**
+   - Supabaseプロジェクトを作成
+   - SQLエディタで`database/create_tables.sql`を実行
+   - 接続URLを取得
+
+2. **Streamlit Cloudでアプリをデプロイ**
+   - GitHubリポジトリを接続
+   - Main file path: `src/app.py`を指定
+   - Secretsに環境変数を設定
+
+3. **必要な環境変数（Secrets）**
+   ```toml
+   DATABASE_URL = "postgresql://..."
+   OPENAI_API_KEY = "sk-..."
+   GEMINI_API_KEY = "AIza..."
+   # その他使用するSTTモデルのAPIキー
+   ```
+
+### その他のデプロイオプション
+
+- **Render**: Dockerfileを使用
+- **Railway**: PostgreSQLサービスと併用
+- **Heroku**: Procfileを追加して対応
+
+## 音声録音機能（開発中）
+
+`recording/`ディレクトリに音声録音用のWebアプリが含まれています：
+
+- **ブラウザベースの録音機能**: マイク入力をリアルタイムで録音
+- **自動音声検出**: 無音を検出して自動的に録音を分割
+- **Webhookサーバー**: Google Cloud Speech-to-Textと連携
+- **スプレッドシート連携**: 文字起こし結果を自動記録
+
+今後、このStreamlitアプリと統合予定です。
