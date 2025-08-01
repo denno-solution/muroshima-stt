@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class AppSettings:
     """アプリケーション設定を管理するクラス"""
     
-    def __init__(self, settings_file: str = ".app_settings.json"):
+    def __init__(self, settings_file: str = "settings.json"):
         self.settings_path = Path(__file__).parent.parent / settings_file
         self.settings = self._load_settings()
     
@@ -64,3 +64,11 @@ class AppSettings:
     def set_debug_mode(self, debug: bool):
         """デバッグモードの有効/無効を保存"""
         self.set("debug_mode", debug)
+    
+    def get_auto_reload_env(self) -> bool:
+        """環境変数の自動リロード機能の有効/無効を取得"""
+        return self.get("auto_reload_env", True)
+    
+    def set_auto_reload_env(self, auto_reload: bool):
+        """環境変数の自動リロード機能の有効/無効を保存"""
+        self.set("auto_reload_env", auto_reload)
