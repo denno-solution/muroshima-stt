@@ -33,3 +33,6 @@ transcriptions/
 # Serena MCP
 .serena/cache/
 .serena/logs/
+
+# macOS
+.DS_Store
