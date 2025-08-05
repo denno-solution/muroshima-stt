@@ -29,3 +29,7 @@ logs/
 # Audio data and transcriptions
 data/
 transcriptions/
+
+# Serena MCP
+.serena/cache/
+.serena/logs/
