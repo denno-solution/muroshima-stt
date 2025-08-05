@@ -18,7 +18,7 @@ from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
 from app_settings import AppSettings
-from auth import check_password, logout
+from auth import check_password, logout, get_cookie_manager, _AUTH_COOKIE_NAME
 
 # ロガーの設定
 logger = logging.getLogger(__name__)
@@ -51,6 +51,25 @@ check_env_changes()
 # アプリ設定の初期化
 settings = AppSettings()
 
+# Cookie管理の処理
+cookie_manager = get_cookie_manager()
+
+# Cookieを保存する必要がある場合
+if "save_auth_cookie" in st.session_state and st.session_state.save_auth_cookie:
+    if "auth_token_to_save" in st.session_state:
+        cookie_manager.set(
+            _AUTH_COOKIE_NAME,
+            st.session_state.auth_token_to_save,
+            expires_at=datetime.now() + timedelta(days=1)
+        )
+        del st.session_state.auth_token_to_save
+    st.session_state.save_auth_cookie = False
+
+# Cookieをクリアする必要がある場合
+if "clear_auth_cookie" in st.session_state and st.session_state.clear_auth_cookie:
+    cookie_manager.delete(_AUTH_COOKIE_NAME)
+    st.session_state.clear_auth_cookie = False
+
 # Basic認証チェック
 if not check_password():
     st.stop()
@@ -62,6 +81,12 @@ st.markdown("音声ファイルをアップロードして、文字起こしと�
 # セッション状態の初期化
 if "transcriptions" not in st.session_state:
     st.session_state.transcriptions = []
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+if "mic_processing" not in st.session_state:
+    st.session_state.mic_processing = False
+if "mic_audio_bytes" not in st.session_state:
+    st.session_state.mic_audio_bytes = None
 if "settings" not in st.session_state:
     st.session_state.settings = settings
 
@@ -74,7 +99,7 @@ with st.sidebar:
     
     # 保存された選択を取得、なければデフォルト値を使用
     saved_model = settings.get_selected_stt_model()
-    default_index = 0
+    default_index = 4  # ElevenLabsをデフォルトに設定
     if saved_model and saved_model in available_models:
         default_index = available_models.index(saved_model)
     
@@ -204,7 +229,8 @@ with tab1:
         st.dataframe(df_files, use_container_width=True)
         
         # 処理開始ボタン
-        if st.button("🚀 文字起こし開始", type="primary", use_container_width=True):
+        if st.button("🚀 文字起こし開始", type="primary", use_container_width=True, disabled=st.session_state.processing):
+            st.session_state.processing = True
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -214,6 +240,7 @@ with tab1:
                 text_structurer = TextStructurer() if use_structuring else None
             except Exception as e:
                 st.error(f"初期化エラー: {e}")
+                st.session_state.processing = False
                 st.stop()
             
             # 各ファイルを処理
@@ -307,6 +334,8 @@ with tab1:
             
             progress_bar.progress(1.0)
             status_text.text("✅ すべての処理が完了しました！")
+            st.session_state.processing = False
+            st.rerun()
 
 with tab2:
     st.header("マイク録音")
@@ -317,14 +346,26 @@ with tab2:
     audio_bytes = st.audio_input("🎙️ マイクで録音してください", help="録音ボタンを押して音声を録音し、停止ボタンで録音を終了してください")
     
     if audio_bytes:
-        st.success("録音完了！処理を開始します...")
+        # 新しい録音があれば保存
+        if audio_bytes != st.session_state.mic_audio_bytes:
+            st.session_state.mic_audio_bytes = audio_bytes
+            st.session_state.mic_processing = False
+        
+        st.success("録音完了！")
+        
+        # 確認ダイアログ
+        if not st.session_state.mic_processing:
+            if st.button("🚀 文字起こしてデータベースに保存しますか？", type="primary", key="mic_process_button"):
+                st.session_state.mic_processing = True
+                st.rerun()
         
         # 録音データを処理
-        try:
-            # 一時ファイルとして保存
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
-                tmp_file.write(audio_bytes)
-                tmp_path = tmp_file.name
+        if st.session_state.mic_processing:
+            try:
+                # 一時ファイルとして保存
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
+                    tmp_file.write(audio_bytes)
+                    tmp_path = tmp_file.name
             
             logger.info(f"マイク録音処理開始: {tmp_path}")
             
@@ -421,19 +462,24 @@ with tab2:
                     else:
                         st.error("❌ マイク録音の文字起こしに失敗しました（結果が空）")
             
-            # 一時ファイルを削除
-            os.unlink(tmp_path)
-            logger.debug(f"一時ファイル削除: {tmp_path}")
-            
-        except Exception as e:
-            error_msg = f"マイク録音処理エラー: {str(e)}"
-            st.error(error_msg)
-            logger.error(error_msg, exc_info=True)
+                # 一時ファイルを削除
+                os.unlink(tmp_path)
+                logger.debug(f"一時ファイル削除: {tmp_path}")
+                
+                # 処理完了後、状態をリセット
+                st.session_state.mic_processing = False
+                st.session_state.mic_audio_bytes = None
+                
+            except Exception as e:
+                error_msg = f"マイク録音処理エラー: {str(e)}"
+                st.error(error_msg)
+                logger.error(error_msg, exc_info=True)
+                st.session_state.mic_processing = False
     
     st.divider()
     st.markdown("**💡 使い方のヒント:**")
     st.markdown("- 録音ボタンを押してから話してください")
-    st.markdown("- 録音終了後、自動的に文字起こしが開始されます")
+    st.markdown("- 録音終了後、「文字起こして保存」ボタンをクリック")
     st.markdown("- 録音データは一時的に保存され、処理後に削除されます")
 
 with tab3:

@@ -412,6 +412,18 @@ wheels = [
 ]
 
 [[package]]
+name = "extra-streamlit-components"
+version = "0.1.80"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "streamlit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f9/0c/25da4c19a32b0a01e117c81a6a9ba068dfb05bafe97b5db2aa4a3976893e/extra_streamlit_components-0.1.80.tar.gz", hash = "sha256:87d6c38e07381501d8882796adef17d1c1d4e3a79615864d95c1163d2bc136f6", size = 2250100 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f8/6e/8df6b6330ff8e2c745a7371972990e1bd2d6df29a933a4743f797fe7e287/extra_streamlit_components-0.1.80-py3-none-any.whl", hash = "sha256:7a8c151da5dcd1f1f97b6c29caa812a1d77928d20fc4bf42a3a4fd788274dd9e", size = 2278493 },
+]
+
+[[package]]
 name = "gitdb"
 version = "4.0.12"
 source = { registry = "https://pypi.org/simple" }
@@ -2130,6 +2142,7 @@ dependencies = [
     { name = "azure-cognitiveservices-speech" },
     { name = "boto3" },
     { name = "elevenlabs" },
+    { name = "extra-streamlit-components" },
     { name = "google-cloud-speech" },
     { name = "google-genai" },
     { name = "librosa" },
@@ -2155,6 +2168,7 @@ requires-dist = [
     { name = "azure-cognitiveservices-speech", specifier = ">=1.30.0" },
     { name = "boto3", specifier = ">=1.28.0" },
     { name = "elevenlabs", specifier = ">=0.2.0" },
+    { name = "extra-streamlit-components", specifier = ">=0.1.80" },
     { name = "google-cloud-speech", specifier = ">=2.20.0" },
     { name = "google-genai", specifier = ">=0.2.4" },
     { name = "librosa", specifier = ">=0.10.0" },
