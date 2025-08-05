@@ -14,6 +14,14 @@ def get_env_hash():
 
 def check_env_changes():
     """環境変数の変更をチェックして必要に応じてリロード"""
+    # app_settingsをimportして自動リロード設定を確認
+    from app_settings import AppSettings
+    settings = AppSettings()
+    
+    # 自動リロードが無効の場合は何もしない
+    if not settings.get_auto_reload_env():
+        return
+    
     # 現在のハッシュ値を取得
     current_hash = get_env_hash()
     
