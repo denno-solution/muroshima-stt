@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class AppSettings:
     """アプリケーション設定を管理するクラス"""
     
-    def __init__(self, settings_file: str = "settings.json"):
+    def __init__(self, settings_file: str = ".app_settings.json"):
         self.settings_path = Path(__file__).parent.parent / settings_file
         self.settings = self._load_settings()
     
