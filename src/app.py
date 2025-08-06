@@ -62,6 +62,12 @@ st.markdown("音声ファイルをアップロードして、文字起こしと�
 # セッション状態の初期化
 if "transcriptions" not in st.session_state:
     st.session_state.transcriptions = []
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+if "mic_processing" not in st.session_state:
+    st.session_state.mic_processing = False
+if "mic_audio_bytes" not in st.session_state:
+    st.session_state.mic_audio_bytes = None
 if "settings" not in st.session_state:
     st.session_state.settings = settings
 
@@ -74,7 +80,7 @@ with st.sidebar:
     
     # 保存された選択を取得、なければデフォルト値を使用
     saved_model = settings.get_selected_stt_model()
-    default_index = 0
+    default_index = 4  # ElevenLabsをデフォルトに設定
     if saved_model and saved_model in available_models:
         default_index = available_models.index(saved_model)
     
@@ -175,7 +181,7 @@ with st.sidebar:
             st.rerun()
 
 # メインエリア
-tab1, tab2, tab3 = st.tabs(["📤 アップロード", "📊 処理結果", "🗄️ データベース"])
+tab1, tab2, tab3, tab4 = st.tabs(["📤 アップロード", "🎙️ マイク録音", "📊 処理結果", "🗄️ データベース"])
 
 with tab1:
     st.header("音声ファイルアップロード")
@@ -204,7 +210,8 @@ with tab1:
         st.dataframe(df_files, use_container_width=True)
         
         # 処理開始ボタン
-        if st.button("🚀 文字起こし開始", type="primary", use_container_width=True):
+        if st.button("🚀 文字起こし開始", type="primary", use_container_width=True, disabled=st.session_state.processing):
+            st.session_state.processing = True
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -214,6 +221,7 @@ with tab1:
                 text_structurer = TextStructurer() if use_structuring else None
             except Exception as e:
                 st.error(f"初期化エラー: {e}")
+                st.session_state.processing = False
                 st.stop()
             
             # 各ファイルを処理
@@ -307,8 +315,159 @@ with tab1:
             
             progress_bar.progress(1.0)
             status_text.text("✅ すべての処理が完了しました！")
+            st.session_state.processing = False
+            st.rerun()
 
 with tab2:
+    st.header("マイク録音")
+    
+    st.markdown("**マイクから直接音声を録音して文字起こしします**")
+    
+    # 録音機能
+    audio_bytes = st.audio_input("🎙️ マイクで録音してください", help="録音ボタンを押して音声を録音し、停止ボタンで録音を終了してください")
+    
+    if audio_bytes:
+        # 新しい録音があれば保存
+        if audio_bytes != st.session_state.mic_audio_bytes:
+            st.session_state.mic_audio_bytes = audio_bytes
+            st.session_state.mic_processing = False
+        
+        st.success("録音完了！")
+        
+        # 確認ダイアログ
+        if not st.session_state.mic_processing:
+            if st.button("🚀 文字起こしてデータベースに保存しますか？", type="primary", key="mic_process_button"):
+                st.session_state.mic_processing = True
+                st.rerun()
+        
+        # 録音データを処理
+        if st.session_state.mic_processing:
+            try:
+                # 一時ファイルとして保存
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
+                    # audio_bytesがUploadedFileオブジェクトの場合はgetvalue()でバイト列を取得
+                    if hasattr(audio_bytes, 'getvalue'):
+                        tmp_file.write(audio_bytes.getvalue())
+                    else:
+                        tmp_file.write(audio_bytes)
+                    tmp_path = tmp_file.name
+                
+                logger.info(f"マイク録音処理開始: {tmp_path}")
+                
+                # 音声ファイルの情報取得
+                try:
+                    audio_data, sr = librosa.load(tmp_path, sr=None)
+                    duration = len(audio_data) / sr
+                    logger.debug(f"録音音声情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
+                except Exception as e:
+                    # librosaで読み込めない場合のフォールバック
+                    duration = 0.0
+                    logger.warning(f"音声情報取得失敗（処理は継続）: {e}")
+                
+                # STTモデルの初期化
+                stt_wrapper = STTModelWrapper(selected_model)
+                text_structurer = TextStructurer() if use_structuring else None
+                
+                # 文字起こし実行
+                with st.spinner("文字起こし中..."):
+                    transcription = stt_wrapper.transcribe(tmp_path)
+                    
+                    # エラーメッセージを含むタプルかチェック
+                    error_msg = None
+                    if isinstance(transcription, tuple) and transcription[0] is None:
+                        error_msg = transcription[1]
+                        transcription = None
+                        logger.error(f"マイク録音文字起こしエラー: {error_msg}")
+                    
+                    if transcription:
+                        # 構造化処理
+                        structured_data = None
+                        tags = "マイク録音"
+                        
+                        if use_structuring and text_structurer:
+                            with st.spinner("テキスト構造化中..."):
+                                structured_data = text_structurer.structure_text(transcription)
+                                if structured_data:
+                                    tags = text_structurer.extract_tags(structured_data)
+                        
+                        # 結果を保存
+                        timestamp = datetime.now()
+                        result = {
+                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm",
+                            "録音時刻": timestamp,
+                            "録音時間": duration,
+                            "文字起こしテキスト": transcription,
+                            "構造化データ": structured_data,
+                            "タグ": tags,
+                            "発言人数": 1
+                        }
+                        
+                        st.session_state.transcriptions.append(result)
+                        
+                        # データベースに保存
+                        db = next(get_db())
+                        try:
+                            audio_record = AudioTranscription(
+                                音声ファイルpath=result["ファイル名"],
+                                発言人数=1,
+                                録音時刻=timestamp,
+                                録音時間=duration,
+                                文字起こしテキスト=transcription,
+                                構造化データ=structured_data,
+                                タグ=tags
+                            )
+                            db.add(audio_record)
+                            db.commit()
+                            logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
+                        finally:
+                            db.close()
+                        
+                        # 結果表示
+                        st.success("✅ 文字起こし完了！")
+                        
+                        col1, col2 = st.columns([1, 1])
+                        with col1:
+                            st.subheader("文字起こし結果")
+                            st.text_area("", transcription, height=200, key="mic_transcription")
+                            st.write(f"**録音時間:** {duration:.1f}秒")
+                            st.write(f"**タグ:** {tags}")
+                        
+                        with col2:
+                            if structured_data:
+                                st.subheader("構造化データ")
+                                st.json(structured_data)
+                            else:
+                                st.info("構造化データはありません")
+                    
+                    else:
+                        # エラーメッセージがある場合は詳細を表示
+                        if error_msg:
+                            st.error(f"❌ マイク録音の文字起こしに失敗しました")
+                            st.error(f"エラー詳細: {error_msg}")
+                        else:
+                            st.error("❌ マイク録音の文字起こしに失敗しました（結果が空）")
+                
+                    # 一時ファイルを削除
+                    os.unlink(tmp_path)
+                    logger.debug(f"一時ファイル削除: {tmp_path}")
+                    
+                    # 処理完了後、状態をリセット
+                    st.session_state.mic_processing = False
+                    st.session_state.mic_audio_bytes = None
+                    
+            except Exception as e:
+                error_msg = f"マイク録音処理エラー: {str(e)}"
+                st.error(error_msg)
+                logger.error(error_msg, exc_info=True)
+                st.session_state.mic_processing = False
+    
+    st.divider()
+    st.markdown("**💡 使い方のヒント:**")
+    st.markdown("- 録音ボタンを押してから話してください")
+    st.markdown("- 録音終了後、「文字起こして保存」ボタンをクリック")
+    st.markdown("- 録音データは一時的に保存され、処理後に削除されます")
+
+with tab3:
     st.header("処理結果")
     
     if st.session_state.transcriptions:
@@ -334,7 +493,7 @@ with tab2:
     else:
         st.info("処理結果がありません。音声ファイルをアップロードして処理を開始してください。")
 
-with tab3:
+with tab4:
     st.header("データベース内容")
     
     # データベースから全レコードを取得

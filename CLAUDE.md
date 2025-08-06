@@ -5,11 +5,14 @@ Streamlitを使用した音声文字起こしWebアプリケーションです�
 ## 機能
 
 - 複数の音声ファイルの同時アップロード
+- マイクからの直接録音機能
 - 複数のSTTモデルから選択可能（OpenAI、Google Cloud、Amazon、Azure、ElevenLabs）
+  - デフォルト: ElevenLabs
 - Gemini Flash 2.5-liteによる文字起こしテキストの自動構造化（thinking mode + structured output対応）
-- SQLiteデータベースへの結果保存
+- PostgreSQL/SQLiteデータベースへの結果保存
 - 処理結果の閲覧と検索
 - Basic認証によるアクセス制限（オプション）
+- 処理中のUI制御（ボタン無効化など）
 
 ## クイックスタート
 
@@ -58,10 +61,12 @@ uv run streamlit run src/app.py
 ### 4. 使い方
 
 1. ブラウザで http://localhost:8501 を開く
-2. サイドバーでSTTモデルを選択
-3. 音声ファイルをアップロード（複数可）
-4. 「文字起こし開始」をクリック
-5. 結果を確認
+2. サイドバーでSTTモデルを選択（デフォルト: ElevenLabs）
+3. 以下のいずれかの方法で音声を入力：
+   - **「📤 アップロード」タブ**: 音声ファイルをアップロード（複数可）→「文字起こし開始」をクリック
+   - **「🎙️ マイク録音」タブ**: マイクで録音 → 「文字起こしてデータベースに保存しますか？」をクリック
+4. 「📊 処理結果」タブで結果を確認
+5. 「🗄️ データベース」タブで過去の処理結果を検索・閲覧
 
 ## 詳細セットアップ
 
@@ -80,14 +85,16 @@ cp .env.example .env
 nano .env  # またはお好みのエディタを使用
 ```
 
-#### サンプル.env設定（OpenAIを使う場合）
+#### サンプル.env設定（ElevenLabsを使う場合）
 
 ```env
 # データベース（Supabase使用時）
 DATABASE_URL=postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
 
-# STTモデル
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxx
+# STTモデル（デフォルトはElevenLabs）
+ELEVENLABS_API_KEY=xi-xxxxxxxxxxxxxxxxxxxxx
+# 他のSTTモデルを使う場合は該当するAPIキーを設定
+# OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxx
 
 # 構造化機能用
 GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxx
@@ -147,15 +154,24 @@ uv run streamlit run src/app.py
 
 2. ブラウザでアプリが開きます（通常は http://localhost:8501）
 
-3. サイドバーでSTTモデルを選択
+3. サイドバーでSTTモデルを選択（デフォルト: ElevenLabs）
 
-4. 「アップロード」タブで音声ファイルを選択してアップロード
+4. 音声入力方法を選択：
 
-5. 「文字起こし開始」ボタンをクリックして処理を実行
+   ### ファイルアップロード
+   - 「📤 アップロード」タブを選択
+   - 音声ファイルを選択してアップロード（複数可）
+   - 「🚀 文字起こし開始」ボタンをクリック（処理中は自動的に無効化）
+   
+   ### マイク録音
+   - 「🎙️ マイク録音」タブを選択
+   - 「🎙️ マイクで録音してください」ボタンをクリック
+   - 録音開始 → 話す → 停止ボタンで録音終了
+   - 「🚀 文字起こしてデータベースに保存しますか？」ボタンをクリック
 
-6. 「処理結果」タブで結果を確認
+5. 「📊 処理結果」タブで結果を確認
 
-7. 「データベース」タブで過去の処理結果を検索・閲覧
+6. 「🗄️ データベース」タブで過去の処理結果を検索・閲覧
 
 ### 設定の永続化
 
@@ -174,6 +190,7 @@ uv run streamlit run src/app.py
 - **設定方法**: 環境変数に`BASIC_AUTH_USERNAME`と`BASIC_AUTH_PASSWORD`を設定
 - **動作**: 両方の環境変数が設定されている場合のみ認証が有効化されます
 - **ログアウト**: サイドバーにログアウトボタンが表示されます
+- **Cookie認証**: ログイン成功時に認証トークンがCookieに保存され、24時間は再認証不要です
 
 ```env
 # Basic認証を有効化する場合
@@ -182,6 +199,12 @@ BASIC_AUTH_PASSWORD=your-secure-password
 ```
 
 注意: 本番環境では強力なパスワードを設定してください。
+
+#### Cookie認証の仕組み
+- ログイン成功時に安全なランダムトークンを生成
+- トークンはCookieに保存（有効期限: 24時間）
+- ブラウザをリロードしてもCookieが有効な限り自動ログイン
+- ログアウト時にCookieは削除されます
 
 ## データベーススキーマ
 
