@@ -12,10 +12,9 @@ _AUTH_COOKIE_NAME = "stt_auth_token"
 _AUTH_TOKENS_KEY = "auth_tokens"  # 有効なトークンを保存するセッションキー
 
 # CookieManagerのシングルトンインスタンス
-@st.cache_resource
 def get_cookie_manager():
     """クッキーマネージャーのシングルトンインスタンスを取得"""
-    return stx.CookieManager()
+    return stx.CookieManager(key="auth_cookie_manager")
 
 def _generate_token():
     """セキュアなランダムトークンを生成"""
@@ -52,6 +51,28 @@ def _check_auth_token(token):
             del st.session_state[_AUTH_TOKENS_KEY][token]
     return False
 
+def _handle_cookie_operations():
+    """Cookie保存・削除処理を実行"""
+    cookie_manager = get_cookie_manager()
+    
+    # Cookieを保存する必要がある場合
+    if "save_auth_cookie" in st.session_state and st.session_state.save_auth_cookie:
+        if "auth_token_to_save" in st.session_state:
+            cookie_manager.set(
+                _AUTH_COOKIE_NAME,
+                st.session_state.auth_token_to_save,
+                expires_at=datetime.now() + timedelta(days=1)
+            )
+            del st.session_state.auth_token_to_save
+        st.session_state.save_auth_cookie = False
+    
+    # Cookieをクリアする必要がある場合
+    if "clear_auth_cookie" in st.session_state and st.session_state.clear_auth_cookie:
+        cookie_manager.delete(_AUTH_COOKIE_NAME)
+        st.session_state.clear_auth_cookie = False
+    
+    return cookie_manager
+
 def check_password():
     """
     Basic認証のチェック（Cookie認証対応）
@@ -69,8 +90,8 @@ def check_password():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
-    # Cookieマネージャーの初期化と読み込み
-    cookie_manager = get_cookie_manager()
+    # Cookie操作を処理し、Cookieマネージャーを取得
+    cookie_manager = _handle_cookie_operations()
     
     # Cookieからトークンを読み取り
     saved_token = cookie_manager.get(_AUTH_COOKIE_NAME)

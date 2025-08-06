@@ -18,7 +18,7 @@ from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
 from app_settings import AppSettings
-from auth import check_password, logout, get_cookie_manager, _AUTH_COOKIE_NAME
+from auth import check_password, logout
 
 # ロガーの設定
 logger = logging.getLogger(__name__)
@@ -50,25 +50,6 @@ check_env_changes()
 
 # アプリ設定の初期化
 settings = AppSettings()
-
-# Cookie管理の処理
-cookie_manager = get_cookie_manager()
-
-# Cookieを保存する必要がある場合
-if "save_auth_cookie" in st.session_state and st.session_state.save_auth_cookie:
-    if "auth_token_to_save" in st.session_state:
-        cookie_manager.set(
-            _AUTH_COOKIE_NAME,
-            st.session_state.auth_token_to_save,
-            expires_at=datetime.now() + timedelta(days=1)
-        )
-        del st.session_state.auth_token_to_save
-    st.session_state.save_auth_cookie = False
-
-# Cookieをクリアする必要がある場合
-if "clear_auth_cookie" in st.session_state and st.session_state.clear_auth_cookie:
-    cookie_manager.delete(_AUTH_COOKIE_NAME)
-    st.session_state.clear_auth_cookie = False
 
 # Basic認証チェック
 if not check_password():
@@ -364,112 +345,116 @@ with tab2:
             try:
                 # 一時ファイルとして保存
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
-                    tmp_file.write(audio_bytes)
-                    tmp_path = tmp_file.name
-            
-            logger.info(f"マイク録音処理開始: {tmp_path}")
-            
-            # 音声ファイルの情報取得
-            try:
-                audio_data, sr = librosa.load(tmp_path, sr=None)
-                duration = len(audio_data) / sr
-                logger.debug(f"録音音声情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
-            except Exception as e:
-                # librosaで読み込めない場合のフォールバック
-                duration = 0.0
-                logger.warning(f"音声情報取得失敗（処理は継続）: {e}")
-            
-            # STTモデルの初期化
-            stt_wrapper = STTModelWrapper(selected_model)
-            text_structurer = TextStructurer() if use_structuring else None
-            
-            # 文字起こし実行
-            with st.spinner("文字起こし中..."):
-                transcription = stt_wrapper.transcribe(tmp_path)
-                
-                # エラーメッセージを含むタプルかチェック
-                error_msg = None
-                if isinstance(transcription, tuple) and transcription[0] is None:
-                    error_msg = transcription[1]
-                    transcription = None
-                    logger.error(f"マイク録音文字起こしエラー: {error_msg}")
-                
-                if transcription:
-                    # 構造化処理
-                    structured_data = None
-                    tags = "マイク録音"
-                    
-                    if use_structuring and text_structurer:
-                        with st.spinner("テキスト構造化中..."):
-                            structured_data = text_structurer.structure_text(transcription)
-                            if structured_data:
-                                tags = text_structurer.extract_tags(structured_data)
-                    
-                    # 結果を保存
-                    timestamp = datetime.now()
-                    result = {
-                        "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm",
-                        "録音時刻": timestamp,
-                        "録音時間": duration,
-                        "文字起こしテキスト": transcription,
-                        "構造化データ": structured_data,
-                        "タグ": tags,
-                        "発言人数": 1
-                    }
-                    
-                    st.session_state.transcriptions.append(result)
-                    
-                    # データベースに保存
-                    db = next(get_db())
-                    try:
-                        audio_record = AudioTranscription(
-                            音声ファイルpath=result["ファイル名"],
-                            発言人数=1,
-                            録音時刻=timestamp,
-                            録音時間=duration,
-                            文字起こしテキスト=transcription,
-                            構造化データ=structured_data,
-                            タグ=tags
-                        )
-                        db.add(audio_record)
-                        db.commit()
-                        logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
-                    finally:
-                        db.close()
-                    
-                    # 結果表示
-                    st.success("✅ 文字起こし完了！")
-                    
-                    col1, col2 = st.columns([1, 1])
-                    with col1:
-                        st.subheader("文字起こし結果")
-                        st.text_area("", transcription, height=200, key="mic_transcription")
-                        st.write(f"**録音時間:** {duration:.1f}秒")
-                        st.write(f"**タグ:** {tags}")
-                    
-                    with col2:
-                        if structured_data:
-                            st.subheader("構造化データ")
-                            st.json(structured_data)
-                        else:
-                            st.info("構造化データはありません")
-                
-                else:
-                    # エラーメッセージがある場合は詳細を表示
-                    if error_msg:
-                        st.error(f"❌ マイク録音の文字起こしに失敗しました")
-                        st.error(f"エラー詳細: {error_msg}")
+                    # audio_bytesがUploadedFileオブジェクトの場合はgetvalue()でバイト列を取得
+                    if hasattr(audio_bytes, 'getvalue'):
+                        tmp_file.write(audio_bytes.getvalue())
                     else:
-                        st.error("❌ マイク録音の文字起こしに失敗しました（結果が空）")
-            
-                # 一時ファイルを削除
-                os.unlink(tmp_path)
-                logger.debug(f"一時ファイル削除: {tmp_path}")
+                        tmp_file.write(audio_bytes)
+                    tmp_path = tmp_file.name
                 
-                # 処理完了後、状態をリセット
-                st.session_state.mic_processing = False
-                st.session_state.mic_audio_bytes = None
+                logger.info(f"マイク録音処理開始: {tmp_path}")
                 
+                # 音声ファイルの情報取得
+                try:
+                    audio_data, sr = librosa.load(tmp_path, sr=None)
+                    duration = len(audio_data) / sr
+                    logger.debug(f"録音音声情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
+                except Exception as e:
+                    # librosaで読み込めない場合のフォールバック
+                    duration = 0.0
+                    logger.warning(f"音声情報取得失敗（処理は継続）: {e}")
+                
+                # STTモデルの初期化
+                stt_wrapper = STTModelWrapper(selected_model)
+                text_structurer = TextStructurer() if use_structuring else None
+                
+                # 文字起こし実行
+                with st.spinner("文字起こし中..."):
+                    transcription = stt_wrapper.transcribe(tmp_path)
+                    
+                    # エラーメッセージを含むタプルかチェック
+                    error_msg = None
+                    if isinstance(transcription, tuple) and transcription[0] is None:
+                        error_msg = transcription[1]
+                        transcription = None
+                        logger.error(f"マイク録音文字起こしエラー: {error_msg}")
+                    
+                    if transcription:
+                        # 構造化処理
+                        structured_data = None
+                        tags = "マイク録音"
+                        
+                        if use_structuring and text_structurer:
+                            with st.spinner("テキスト構造化中..."):
+                                structured_data = text_structurer.structure_text(transcription)
+                                if structured_data:
+                                    tags = text_structurer.extract_tags(structured_data)
+                        
+                        # 結果を保存
+                        timestamp = datetime.now()
+                        result = {
+                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm",
+                            "録音時刻": timestamp,
+                            "録音時間": duration,
+                            "文字起こしテキスト": transcription,
+                            "構造化データ": structured_data,
+                            "タグ": tags,
+                            "発言人数": 1
+                        }
+                        
+                        st.session_state.transcriptions.append(result)
+                        
+                        # データベースに保存
+                        db = next(get_db())
+                        try:
+                            audio_record = AudioTranscription(
+                                音声ファイルpath=result["ファイル名"],
+                                発言人数=1,
+                                録音時刻=timestamp,
+                                録音時間=duration,
+                                文字起こしテキスト=transcription,
+                                構造化データ=structured_data,
+                                タグ=tags
+                            )
+                            db.add(audio_record)
+                            db.commit()
+                            logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
+                        finally:
+                            db.close()
+                        
+                        # 結果表示
+                        st.success("✅ 文字起こし完了！")
+                        
+                        col1, col2 = st.columns([1, 1])
+                        with col1:
+                            st.subheader("文字起こし結果")
+                            st.text_area("", transcription, height=200, key="mic_transcription")
+                            st.write(f"**録音時間:** {duration:.1f}秒")
+                            st.write(f"**タグ:** {tags}")
+                        
+                        with col2:
+                            if structured_data:
+                                st.subheader("構造化データ")
+                                st.json(structured_data)
+                            else:
+                                st.info("構造化データはありません")
+                    
+                    else:
+                        # エラーメッセージがある場合は詳細を表示
+                        if error_msg:
+                            st.error(f"❌ マイク録音の文字起こしに失敗しました")
+                            st.error(f"エラー詳細: {error_msg}")
+                        else:
+                            st.error("❌ マイク録音の文字起こしに失敗しました（結果が空）")
+                
+                    # 一時ファイルを削除
+                    os.unlink(tmp_path)
+                    logger.debug(f"一時ファイル削除: {tmp_path}")
+                    
+                    # 処理完了後、状態をリセット
+                    st.session_state.mic_processing = False
+                    st.session_state.mic_audio_bytes = None
+                    
             except Exception as e:
                 error_msg = f"マイク録音処理エラー: {str(e)}"
                 st.error(error_msg)

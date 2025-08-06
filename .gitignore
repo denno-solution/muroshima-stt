@@ -31,8 +31,11 @@ data/
 transcriptions/
 
 # Serena MCP
-.serena/cache/
-.serena/logs/
+.serena/cache
+.serena/logs
 
 # macOS
 .DS_Store
+
+# Coding Agent
+.claude/
