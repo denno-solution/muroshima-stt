@@ -72,3 +72,36 @@ class AppSettings:
     def set_auto_reload_env(self, auto_reload: bool):
         """環境変数の自動リロード機能の有効/無効を保存"""
         self.set("auto_reload_env", auto_reload)
+    
+    # VAD関連設定
+    def get_vad_enabled(self) -> bool:
+        """VAD機能の有効/無効を取得"""
+        return self.get("vad_enabled", False)
+    
+    def set_vad_enabled(self, enabled: bool):
+        """VAD機能の有効/無効を保存"""
+        self.set("vad_enabled", enabled)
+    
+    def get_vad_aggressiveness(self) -> int:
+        """VADの厳しさを取得 (0-3)"""
+        return self.get("vad_aggressiveness", 2)
+    
+    def set_vad_aggressiveness(self, aggressiveness: int):
+        """VADの厳しさを保存 (0-3)"""
+        self.set("vad_aggressiveness", aggressiveness)
+    
+    def get_vad_min_speech_ms(self) -> int:
+        """最小スピーチ長を取得 (ms)"""
+        return self.get("vad_min_speech_ms", 300)
+    
+    def set_vad_min_speech_ms(self, min_speech_ms: int):
+        """最小スピーチ長を保存 (ms)"""
+        self.set("vad_min_speech_ms", min_speech_ms)
+    
+    def get_vad_merge_gap_ms(self) -> int:
+        """区間マージギャップを取得 (ms)"""
+        return self.get("vad_merge_gap_ms", 300)
+    
+    def set_vad_merge_gap_ms(self, merge_gap_ms: int):
+        """区間マージギャップを保存 (ms)"""
+        self.set("vad_merge_gap_ms", merge_gap_ms)

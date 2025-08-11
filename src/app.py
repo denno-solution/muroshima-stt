@@ -134,6 +134,69 @@ with st.sidebar:
     
     st.divider()
     
+    # VAD設定
+    st.subheader("🔇 VAD設定（コスト削減）")
+    
+    # VAD対応モデルかチェック
+    vad_supported_models = STTModelWrapper.get_vad_supported_models()
+    is_vad_supported = selected_model in vad_supported_models
+    
+    if is_vad_supported:
+        enable_vad = st.checkbox(
+            "VAD（無音除去）を有効化", 
+            value=settings.get_vad_enabled(),
+            help="無音部分を除去してSTT APIの処理時間とコストを削減します"
+        )
+        
+        # 設定が変更されたら保存
+        if enable_vad != settings.get_vad_enabled():
+            settings.set_vad_enabled(enable_vad)
+            logger.info(f"VAD設定を保存: {enable_vad}")
+        
+        if enable_vad:
+            # VADパラメータの詳細設定
+            with st.expander("🔧 VAD詳細設定"):
+                vad_aggressiveness = st.slider(
+                    "VAD厳しさ", 
+                    min_value=0, 
+                    max_value=3, 
+                    value=settings.get_vad_aggressiveness(),
+                    help="0=ゆるい（多くの音声を残す）、3=厳しい（明確な音声のみ残す）"
+                )
+                
+                min_speech_ms = st.slider(
+                    "最小スピーチ長 (ms)", 
+                    min_value=100, 
+                    max_value=1500, 
+                    value=settings.get_vad_min_speech_ms(),
+                    step=50,
+                    help="この長さより短い音声は無視されます"
+                )
+                
+                merge_gap_ms = st.slider(
+                    "区間マージギャップ (ms)", 
+                    min_value=50, 
+                    max_value=1000, 
+                    value=settings.get_vad_merge_gap_ms(),
+                    step=50,
+                    help="この長さ以下の無音は音声区間として統合されます"
+                )
+                
+                # VADパラメータの保存
+                if vad_aggressiveness != settings.get_vad_aggressiveness():
+                    settings.set_vad_aggressiveness(vad_aggressiveness)
+                if min_speech_ms != settings.get_vad_min_speech_ms():
+                    settings.set_vad_min_speech_ms(min_speech_ms)
+                if merge_gap_ms != settings.get_vad_merge_gap_ms():
+                    settings.set_vad_merge_gap_ms(merge_gap_ms)
+            
+            st.success("💰 VADによりElevenLabsのコストを大幅削減できます")
+    else:
+        st.info(f"ℹ️ VADは {', '.join(vad_supported_models)} でサポートされています")
+        enable_vad = False
+    
+    st.divider()
+    
     # デバッグモード
     st.subheader("🐛 デバッグ設定")
     debug_mode = st.checkbox(
@@ -217,8 +280,19 @@ with tab1:
             
             # STTモデルとテキスト構造化の初期化
             try:
-                stt_wrapper = STTModelWrapper(selected_model)
+                stt_wrapper = STTModelWrapper(selected_model, enable_vad=enable_vad)
                 text_structurer = TextStructurer() if use_structuring else None
+                
+                # VADパラメータの準備
+                vad_params = {}
+                if enable_vad and stt_wrapper.is_vad_enabled():
+                    vad_params = {
+                        "min_speech_ms": min_speech_ms,
+                        "merge_gap_ms": merge_gap_ms,
+                        "vad_aggressiveness": vad_aggressiveness
+                    }
+                    logger.info(f"VAD有効: {vad_params}")
+                
             except Exception as e:
                 st.error(f"初期化エラー: {e}")
                 st.session_state.processing = False
@@ -245,8 +319,19 @@ with tab1:
                     logger.debug(f"音声ファイル情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
                     
                     # 文字起こし実行
-                    logger.info(f"文字起こし実行中: {uploaded_file.name} (モデル: {selected_model})")
-                    transcription = stt_wrapper.transcribe(tmp_path)
+                    logger.info(f"文字起こし実行中: {uploaded_file.name} (モデル: {selected_model}, VAD: {enable_vad})")
+                    
+                    # VAD対応の場合はメタデータも取得
+                    if enable_vad and stt_wrapper.is_vad_enabled():
+                        transcription, metadata = stt_wrapper.transcribe_with_metadata(tmp_path, vad_params)
+                        if metadata.get('vad_stats'):
+                            vad_stats = metadata['vad_stats']
+                            logger.info(f"VAD統計: 元時間={vad_stats['original_duration_ms']}ms, "
+                                       f"音声時間={vad_stats['speech_duration_ms']}ms, "
+                                       f"圧縮率={vad_stats['compression_ratio']:.2%}")
+                    else:
+                        transcription = stt_wrapper.transcribe(tmp_path)
+                        metadata = {}
                     
                     # エラーメッセージを含むタプルかチェック
                     error_msg = None
@@ -365,12 +450,33 @@ with tab2:
                     logger.warning(f"音声情報取得失敗（処理は継続）: {e}")
                 
                 # STTモデルの初期化
-                stt_wrapper = STTModelWrapper(selected_model)
+                stt_wrapper = STTModelWrapper(selected_model, enable_vad=enable_vad)
                 text_structurer = TextStructurer() if use_structuring else None
+                
+                # VADパラメータの準備
+                vad_params = {}
+                if enable_vad and stt_wrapper.is_vad_enabled():
+                    vad_params = {
+                        "min_speech_ms": min_speech_ms,
+                        "merge_gap_ms": merge_gap_ms,
+                        "vad_aggressiveness": vad_aggressiveness
+                    }
                 
                 # 文字起こし実行
                 with st.spinner("文字起こし中..."):
-                    transcription = stt_wrapper.transcribe(tmp_path)
+                    logger.info(f"マイク録音文字起こし実行中 (モデル: {selected_model}, VAD: {enable_vad})")
+                    
+                    # VAD対応の場合はメタデータも取得
+                    if enable_vad and stt_wrapper.is_vad_enabled():
+                        transcription, metadata = stt_wrapper.transcribe_with_metadata(tmp_path, vad_params)
+                        if metadata.get('vad_stats'):
+                            vad_stats = metadata['vad_stats']
+                            logger.info(f"マイク録音VAD統計: 元時間={vad_stats['original_duration_ms']}ms, "
+                                       f"音声時間={vad_stats['speech_duration_ms']}ms, "
+                                       f"圧縮率={vad_stats['compression_ratio']:.2%}")
+                    else:
+                        transcription = stt_wrapper.transcribe(tmp_path)
+                        metadata = {}
                     
                     # エラーメッセージを含むタプルかチェック
                     error_msg = None

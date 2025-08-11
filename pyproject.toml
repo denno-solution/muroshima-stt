@@ -24,6 +24,9 @@ dependencies = [
     "watchdog>=6.0.0",
     "psycopg2-binary>=2.9.10",
     "extra-streamlit-components>=0.1.80",
+    # VAD (Voice Activity Detection)
+    "webrtcvad-wheels>=2.0.11",
+    "numpy>=1.24.0",
 ]
 
 [tool.uv]
