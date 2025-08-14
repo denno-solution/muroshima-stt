@@ -19,6 +19,8 @@ from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
 from app_settings import AppSettings
 from auth import check_password, logout
+from semantic_search import get_semantic_search_engine
+from rag_qa import get_rag_qa_system
 
 # ロガーの設定
 logger = logging.getLogger(__name__)
@@ -292,6 +294,27 @@ with tab1:
                             )
                             db.add(audio_record)
                             db.commit()
+                            
+                            # ベクトルDBに追加
+                            try:
+                                search_engine = get_semantic_search_engine()
+                                doc_id = f"audio_{audio_record.音声ID}"
+                                metadata = {
+                                    "audio_id": audio_record.音声ID,
+                                    "file_path": uploaded_file.name,
+                                    "recording_time": audio_record.録音時刻.isoformat(),
+                                    "duration": duration,
+                                    "speakers": 1,
+                                    "tags": tags or ""
+                                }
+                                if structured_data:
+                                    metadata["structured_data"] = str(structured_data)
+                                
+                                search_engine.add_document(doc_id, transcription, metadata)
+                                logger.info(f"Added to vector DB: {doc_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to add to vector DB: {str(e)}")
+                                
                         finally:
                             db.close()
                     else:
@@ -419,6 +442,27 @@ with tab2:
                             db.add(audio_record)
                             db.commit()
                             logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
+                            
+                            # ベクトルDBに追加
+                            try:
+                                search_engine = get_semantic_search_engine()
+                                doc_id = f"audio_{audio_record.音声ID}"
+                                metadata = {
+                                    "audio_id": audio_record.音声ID,
+                                    "file_path": result["ファイル名"],
+                                    "recording_time": timestamp.isoformat(),
+                                    "duration": duration,
+                                    "speakers": 1,
+                                    "tags": tags or ""
+                                }
+                                if structured_data:
+                                    metadata["structured_data"] = str(structured_data)
+                                
+                                search_engine.add_document(doc_id, transcription, metadata)
+                                logger.info(f"Added to vector DB: {doc_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to add to vector DB: {str(e)}")
+                                
                         finally:
                             db.close()
                         
@@ -496,65 +540,235 @@ with tab3:
 with tab4:
     st.header("データベース内容")
     
-    # データベースから全レコードを取得
-    db = next(get_db())
-    try:
-        records = db.query(AudioTranscription).all()
+    # セマンティック検索機能
+    st.subheader("🔍 セマンティック検索")
+    
+    # 検索タブ
+    search_tab1, search_tab2, search_tab3 = st.tabs(["🤖 AI質問応答", "💭 意味検索", "📋 全レコード"])
+    
+    with search_tab1:
+        st.subheader("🤖 AI質問応答")
+        st.markdown("**議事録に関する質問を自然言語で入力してください。AIが関連する情報を検索して回答します。**")
         
-        if records:
-            # データフレームに変換
-            data = []
-            for record in records:
-                data.append({
-                    "音声ID": record.音声ID,
-                    "音声ファイル": record.音声ファイルpath,
-                    "発言人数": record.発言人数,
-                    "録音時刻": record.録音時刻,
-                    "録音時間(s)": record.録音時間,
-                    "タグ": record.タグ,
-                    "文字起こし": record.文字起こしテキスト[:50] + "..." if len(record.文字起こしテキスト) > 50 else record.文字起こしテキスト
-                })
-            
-            df = pd.DataFrame(data)
-            
-            # フィルタリング
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                tag_filter = st.selectbox("タグでフィルタ", ["すべて"] + list(df["タグ"].unique()))
-            
-            if tag_filter != "すべて":
-                df = df[df["タグ"] == tag_filter]
-            
-            # データテーブル表示
-            st.dataframe(df, use_container_width=True)
-            
-            # 詳細表示
-            if st.checkbox("詳細を表示"):
-                selected_id = st.selectbox("音声IDを選択", df["音声ID"].tolist())
+        # 質問入力
+        question = st.text_area(
+            "質問を入力してください",
+            placeholder="例：\n・予算削減についてこれまでどのような議論がありましたか？\n・人事制度の見直しで決まったことを教えてください\n・プロジェクトの進捗状況はどうなっていますか？",
+            height=100,
+            help="具体的で明確な質問ほど、正確な回答が得られます。"
+        )
+        
+        # 設定オプション
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_sources = st.selectbox("参照する記録数", [3, 5, 8, 10], index=1)
+        with col2:
+            min_similarity = st.slider("類似度閾値", 0.3, 0.9, 0.5, 0.1)
+        with col3:
+            show_sources = st.checkbox("参照ソースを表示", value=True)
+        
+        if question and question.strip():
+            try:
+                # RAG質問応答システムを取得
+                rag_system = get_rag_qa_system()
                 
-                if selected_id:
-                    record = db.query(AudioTranscription).filter_by(音声ID=selected_id).first()
-                    if record:
-                        st.subheader(f"音声ID: {record.音声ID} の詳細")
-                        
-                        col1, col2 = st.columns([1, 1])
-                        with col1:
-                            st.write(f"**ファイル:** {record.音声ファイルpath}")
-                            st.write(f"**録音時刻:** {record.録音時刻}")
-                            st.write(f"**録音時間:** {record.録音時間}秒")
-                            st.write(f"**タグ:** {record.タグ}")
+                # 質問応答実行
+                with st.spinner("🔍 関連情報を検索してAIが回答を生成中..."):
+                    result = rag_system.answer_question(
+                        question=question.strip(),
+                        max_context_docs=max_sources,
+                        min_similarity=min_similarity
+                    )
+                
+                # 回答表示
+                st.markdown("### 💬 AI回答")
+                
+                # 信頼度に応じてスタイル変更
+                confidence = result.get('confidence', 0.0)
+                if confidence >= 0.7:
+                    st.success("🎯 高信頼度の回答")
+                elif confidence >= 0.5:
+                    st.info("📝 中程度の信頼度")
+                else:
+                    st.warning("⚠️ 低信頼度（参考程度）")
+                
+                # 回答本文
+                st.markdown(result['answer'])
+                
+                # メタデータ表示
+                metadata = result.get('metadata', {})
+                col_meta1, col_meta2, col_meta3 = st.columns(3)
+                with col_meta1:
+                    st.metric("信頼度", f"{confidence:.1%}")
+                with col_meta2:
+                    st.metric("検索件数", metadata.get('search_count', 0))
+                with col_meta3:
+                    st.metric("参照記録", len(result.get('sources', [])))
+                
+                # 参照ソース表示
+                if show_sources and result.get('sources'):
+                    st.markdown("### 📚 参照した音声記録")
+                    
+                    for i, source in enumerate(result['sources'], 1):
+                        with st.expander(f"📄 音声記録 {i} - ID {source.get('audio_id', 'Unknown')} (類似度: {source.get('similarity_score', 0):.3f})"):
+                            col_src1, col_src2 = st.columns(2)
                             
-                            st.subheader("文字起こしテキスト")
-                            st.text_area("", record.文字起こしテキスト, height=200)
+                            with col_src1:
+                                st.markdown(f"**📁 ファイル:** {source.get('file_path', 'N/A')}")
+                                recording_time = source.get('recording_time', '')
+                                if recording_time:
+                                    st.markdown(f"**📅 録音時刻:** {recording_time[:19]}")
+                            
+                            with col_src2:
+                                st.markdown(f"**🎯 類似度:** {source.get('similarity_score', 0):.3f}")
+                            
+                            st.markdown("**📝 内容:**")
+                            st.write(source.get('excerpt', ''))
+                
+                # エラー情報がある場合は表示
+                if 'error' in metadata:
+                    st.error(f"エラー詳細: {metadata['error']}")
+                    
+            except Exception as e:
+                st.error(f"質問応答エラー: {str(e)}")
+                logger.error(f"RAG QA error: {str(e)}")
+        
+        elif question and not question.strip():
+            st.info("質問を入力してください。")
+        
+        # 使い方のヒント
+        st.markdown("---")
+        st.markdown("**💡 使い方のコツ:**")
+        st.markdown("- 具体的な質問ほど正確な回答が得られます")
+        st.markdown("- 「いつ」「誰が」「何を」を含めると効果的です")
+        st.markdown("- 複数のトピックを一度に聞くより、個別に質問してください")
+
+    with search_tab2:
+        st.subheader("💭 意味検索")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            search_query = st.text_input(
+                "検索したい内容を入力してください",
+                placeholder="例: 予算削減について、人事制度の見直し、プロジェクトの進捗状況",
+                help="キーワードだけでなく、文章でも検索できます。意味が似ている内容も自動で見つけます。"
+            )
+        
+        with col2:
+            search_limit = st.selectbox("表示件数", [5, 10, 20, 50], index=1, key="semantic_search_limit")
+        
+        if search_query:
+            try:
+                # セマンティック検索エンジンを取得
+                search_engine = get_semantic_search_engine()
+                
+                # ベクトルDBの統計情報を表示
+                stats = search_engine.get_collection_stats()
+                if stats.get("total_documents", 0) == 0:
+                    st.warning("⚠️ ベクトルDBにデータがありません。まず音声データを文字起こしして、ベクトルDBと同期してください。")
+                    st.info("💡 音声を録音・アップロードすると、自動的にベクトルDBに追加されます。")
+                else:
+                    # 検索実行
+                    with st.spinner("検索中..."):
+                        results = search_engine.search(search_query, n_results=search_limit)
+                    
+                    if results:
+                        st.success(f"🎯 {len(results)}件の結果が見つかりました")
                         
-                        with col2:
-                            if record.構造化データ:
-                                st.subheader("構造化データ")
-                                st.json(record.構造化データ)
-        else:
-            st.info("データベースにレコードがありません。")
-    finally:
-        db.close()
+                        for i, result in enumerate(results, 1):
+                            metadata = result['metadata']
+                            similarity = result['similarity_score']
+                            
+                            # 結果を表示
+                            with st.expander(f"#{i} 音声ID {metadata.get('audio_id', 'Unknown')} (類似度: {similarity:.3f})"):
+                                st.markdown(f"**📄 文字起こしテキスト:**")
+                                st.write(result['document'])
+                                
+                                col_meta1, col_meta2 = st.columns(2)
+                                with col_meta1:
+                                    st.markdown(f"**📁 ファイル:** {metadata.get('file_path', 'N/A')}")
+                                    st.markdown(f"**🎙️ 発言人数:** {metadata.get('speakers', 'N/A')}")
+                                
+                                with col_meta2:
+                                    recording_time = metadata.get('recording_time', '')
+                                    if recording_time:
+                                        st.markdown(f"**📅 録音時刻:** {recording_time[:19]}")  # ISO形式の日時から秒まで表示
+                                    st.markdown(f"**⏱️ 録音時間:** {metadata.get('duration', 'N/A')}秒")
+                                
+                                # タグがある場合は表示
+                                tags = metadata.get('tags', '')
+                                if tags:
+                                    st.markdown(f"**🏷️ タグ:** {tags}")
+                    else:
+                        st.info("該当する結果が見つかりませんでした。別のキーワードで試してみてください。")
+                        
+            except Exception as e:
+                st.error(f"検索エラー: {str(e)}")
+                logger.error(f"Semantic search error: {str(e)}")
+    
+    with search_tab3:
+        st.subheader("📋 全レコード一覧")
+        
+        # データベースから全レコードを取得
+        db = next(get_db())
+        try:
+            records = db.query(AudioTranscription).all()
+            
+            if records:
+                # データフレームに変換
+                data = []
+                for record in records:
+                    data.append({
+                        "音声ID": record.音声ID,
+                        "音声ファイル": record.音声ファイルpath,
+                        "発言人数": record.発言人数,
+                        "録音時刻": record.録音時刻,
+                        "録音時間(s)": record.録音時間,
+                        "タグ": record.タグ,
+                        "文字起こし": record.文字起こしテキスト[:50] + "..." if len(record.文字起こしテキスト) > 50 else record.文字起こしテキスト
+                    })
+                
+                df = pd.DataFrame(data)
+                
+                # フィルタリング
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    tag_filter = st.selectbox("タグでフィルタ", ["すべて"] + list(df["タグ"].unique()))
+                
+                if tag_filter != "すべて":
+                    df = df[df["タグ"] == tag_filter]
+                
+                # データテーブル表示
+                st.dataframe(df, use_container_width=True)
+                
+                # 詳細表示
+                if st.checkbox("詳細を表示"):
+                    selected_id = st.selectbox("音声IDを選択", df["音声ID"].tolist())
+                    
+                    if selected_id:
+                        record = db.query(AudioTranscription).filter_by(音声ID=selected_id).first()
+                        if record:
+                            st.subheader(f"音声ID: {record.音声ID} の詳細")
+                            
+                            col1, col2 = st.columns([1, 1])
+                            with col1:
+                                st.write(f"**ファイル:** {record.音声ファイルpath}")
+                                st.write(f"**録音時刻:** {record.録音時刻}")
+                                st.write(f"**録音時間:** {record.録音時間}秒")
+                                st.write(f"**タグ:** {record.タグ}")
+                                
+                                st.subheader("文字起こしテキスト")
+                                st.text_area("", record.文字起こしテキスト, height=200)
+                            
+                            with col2:
+                                if record.構造化データ:
+                                    st.subheader("構造化データ")
+                                    st.json(record.構造化データ)
+            else:
+                st.info("データベースにレコードがありません。")
+        finally:
+            db.close()
 
 # フッター
 st.divider()
