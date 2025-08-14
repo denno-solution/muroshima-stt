@@ -13,7 +13,7 @@ import logging
 # .envファイルを読み込む
 load_dotenv()
 
-from models import AudioTranscription, get_db
+from models import AudioTranscription, get_db, delete_record, delete_all_records
 from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
@@ -412,18 +412,12 @@ with tab2:
     audio_bytes = st.audio_input("🎙️ マイクで録音してください", help="録音ボタンを押して音声を録音し、停止ボタンで録音を終了してください")
     
     if audio_bytes:
-        # 新しい録音があれば保存
+        # 新しい録音があれば自動的に処理を開始
         if audio_bytes != st.session_state.mic_audio_bytes:
             st.session_state.mic_audio_bytes = audio_bytes
-            st.session_state.mic_processing = False
-        
-        st.success("録音完了！")
-        
-        # 確認ダイアログ
-        if not st.session_state.mic_processing:
-            if st.button("🚀 文字起こしてデータベースに保存しますか？", type="primary", key="mic_process_button"):
-                st.session_state.mic_processing = True
-                st.rerun()
+            st.session_state.mic_processing = True
+            st.success("📁 録音完了！文字起こしを開始します...")
+            st.rerun()
         
         # 録音データを処理
         if st.session_state.mic_processing:
@@ -569,8 +563,7 @@ with tab2:
     
     st.divider()
     st.markdown("**💡 使い方のヒント:**")
-    st.markdown("- 録音ボタンを押してから話してください")
-    st.markdown("- 録音終了後、「文字起こして保存」ボタンをクリック")
+    st.markdown("- 録音ボタンを押してから話し、停止ボタンを押して録音を終了してください")
     st.markdown("- 録音データは一時的に保存され、処理後に削除されます")
 
 with tab3:
@@ -657,6 +650,42 @@ with tab4:
                             if record.構造化データ:
                                 st.subheader("構造化データ")
                                 st.json(record.構造化データ)
+                            
+                            # 個別削除ボタン
+                            st.divider()
+                            st.subheader("🗑️ レコード削除")
+                            if st.button(f"音声ID {record.音声ID} を削除", 
+                                       type="secondary", 
+                                       key=f"delete_{record.音声ID}",
+                                       help="このレコードを完全に削除します"):
+                                try:
+                                    if delete_record(record.音声ID):
+                                        st.success(f"音声ID {record.音声ID} を削除しました")
+                                        st.rerun()
+                                    else:
+                                        st.error("削除に失敗しました")
+                                except Exception as e:
+                                    st.error(f"削除エラー: {str(e)}")
+            
+            # 一括削除機能
+            st.divider()
+            st.subheader("🗑️ 一括削除")
+            
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                if st.button("🚨 全レコード削除", 
+                           type="secondary",
+                           help="データベース内の全レコードを削除します"):
+                    try:
+                        deleted_count = delete_all_records()
+                        st.success(f"{deleted_count}件のレコードを削除しました")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"一括削除エラー: {str(e)}")
+            
+            with col2:
+                st.warning("⚠️ 削除したデータは復元できません。慎重に操作してください。")
+        
         else:
             st.info("データベースにレコードがありません。")
     finally:
