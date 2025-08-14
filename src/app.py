@@ -13,7 +13,7 @@ import logging
 # .envファイルを読み込む
 load_dotenv()
 
-from models import AudioTranscription, get_db, delete_record, delete_all_records
+from models import AudioTranscription, get_db
 from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
@@ -651,40 +651,7 @@ with tab4:
                                 st.subheader("構造化データ")
                                 st.json(record.構造化データ)
                             
-                            # 個別削除ボタン
-                            st.divider()
-                            st.subheader("🗑️ レコード削除")
-                            if st.button(f"音声ID {record.音声ID} を削除", 
-                                       type="secondary", 
-                                       key=f"delete_{record.音声ID}",
-                                       help="このレコードを完全に削除します"):
-                                try:
-                                    if delete_record(record.音声ID):
-                                        st.success(f"音声ID {record.音声ID} を削除しました")
-                                        st.rerun()
-                                    else:
-                                        st.error("削除に失敗しました")
-                                except Exception as e:
-                                    st.error(f"削除エラー: {str(e)}")
             
-            # 一括削除機能
-            st.divider()
-            st.subheader("🗑️ 一括削除")
-            
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                if st.button("🚨 全レコード削除", 
-                           type="secondary",
-                           help="データベース内の全レコードを削除します"):
-                    try:
-                        deleted_count = delete_all_records()
-                        st.success(f"{deleted_count}件のレコードを削除しました")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"一括削除エラー: {str(e)}")
-            
-            with col2:
-                st.warning("⚠️ 削除したデータは復元できません。慎重に操作してください。")
         
         else:
             st.info("データベースにレコードがありません。")
