@@ -15,6 +15,8 @@ class AudioTranscription(Base):
     
     音声ID = Column(Integer, primary_key=True, autoincrement=True)
     音声ファイルpath = Column(String(500), nullable=False)
+    音声ファイル格納パス = Column(String(1000), nullable=True)  # サーバー上の実際のファイルパス
+    ファイルサイズ = Column(Integer, nullable=True)  # バイト単位
     発言人数 = Column(Integer, default=1)
     録音時刻 = Column(DateTime, nullable=False, default=datetime.now)
     録音時間 = Column(Float, nullable=False)  # 秒単位

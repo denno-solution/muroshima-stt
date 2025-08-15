@@ -19,6 +19,7 @@ from text_structurer import TextStructurer
 from env_watcher import check_env_changes, display_env_status
 from app_settings import AppSettings
 from auth import check_password, logout
+from audio_storage import get_audio_storage
 
 # ロガーの設定
 logger = logging.getLogger(__name__)
@@ -170,6 +171,32 @@ with st.sidebar:
     
     st.divider()
     
+    # ストレージ統計情報
+    st.subheader("💾 ストレージ使用状況")
+    try:
+        audio_storage = get_audio_storage()
+        storage_stats = audio_storage.get_storage_stats()
+        
+        if "error" not in storage_stats:
+            st.metric("保存ファイル数", storage_stats["total_files"])
+            st.metric("使用容量", f"{storage_stats['total_size_mb']} MB")
+            
+            # クリーンアップボタン（デバッグモードの時のみ表示）
+            if debug_mode:
+                if st.button("🧹 30日以上古いファイルを削除"):
+                    deleted_count = audio_storage.cleanup_old_files(30)
+                    if deleted_count > 0:
+                        st.success(f"✅ {deleted_count}個のファイルを削除しました")
+                        st.rerun()
+                    else:
+                        st.info("削除対象のファイルはありませんでした")
+        else:
+            st.error(f"統計情報取得エラー: {storage_stats['error']}")
+    except Exception as e:
+        st.error(f"ストレージ統計エラー: {str(e)}")
+    
+    st.divider()
+    
     # 環境変数の状態表示
     display_env_status(sidebar=True)
     
@@ -256,6 +283,16 @@ with tab1:
                         logger.error(f"文字起こしエラー: {error_msg}")
                     
                     if transcription:
+                        # 音声ファイルを永続ストレージに保存
+                        audio_storage = get_audio_storage()
+                        try:
+                            stored_path, file_size = audio_storage.save_audio_file(tmp_path, uploaded_file.name)
+                            logger.info(f"音声ファイルを保存: {stored_path} ({file_size} bytes)")
+                        except Exception as e:
+                            logger.error(f"音声ファイル保存エラー: {e}")
+                            stored_path = None
+                            file_size = None
+                        
                         # 構造化処理
                         structured_data = None
                         tags = "未分類"
@@ -283,6 +320,8 @@ with tab1:
                         try:
                             audio_record = AudioTranscription(
                                 音声ファイルpath=uploaded_file.name,
+                                音声ファイル格納パス=stored_path,
+                                ファイルサイズ=file_size,
                                 発言人数=1,
                                 録音時刻=datetime.now(),
                                 録音時間=duration,
@@ -292,6 +331,27 @@ with tab1:
                             )
                             db.add(audio_record)
                             db.commit()
+                            
+                            # ベクトルDBに追加
+                            try:
+                                search_engine = get_semantic_search_engine()
+                                doc_id = f"audio_{audio_record.音声ID}"
+                                metadata = {
+                                    "audio_id": audio_record.音声ID,
+                                    "file_path": uploaded_file.name,
+                                    "recording_time": audio_record.録音時刻.isoformat(),
+                                    "duration": duration,
+                                    "speakers": 1,
+                                    "tags": tags or ""
+                                }
+                                if structured_data:
+                                    metadata["structured_data"] = str(structured_data)
+                                
+                                search_engine.add_document(doc_id, transcription, metadata)
+                                logger.info(f"Added to vector DB: {doc_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to add to vector DB: {str(e)}")
+                                
                         finally:
                             db.close()
                     else:
@@ -380,6 +440,19 @@ with tab2:
                         logger.error(f"マイク録音文字起こしエラー: {error_msg}")
                     
                     if transcription:
+                        # 音声ファイルを永続ストレージに保存
+                        timestamp = datetime.now()
+                        mic_filename = f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm"
+                        
+                        audio_storage = get_audio_storage()
+                        try:
+                            stored_path, file_size = audio_storage.save_audio_file(tmp_path, mic_filename)
+                            logger.info(f"マイク録音ファイルを保存: {stored_path} ({file_size} bytes)")
+                        except Exception as e:
+                            logger.error(f"マイク録音ファイル保存エラー: {e}")
+                            stored_path = None
+                            file_size = None
+                        
                         # 構造化処理
                         structured_data = None
                         tags = "マイク録音"
@@ -391,9 +464,8 @@ with tab2:
                                     tags = text_structurer.extract_tags(structured_data)
                         
                         # 結果を保存
-                        timestamp = datetime.now()
                         result = {
-                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm",
+                            "ファイル名": mic_filename,
                             "録音時刻": timestamp,
                             "録音時間": duration,
                             "文字起こしテキスト": transcription,
@@ -408,7 +480,9 @@ with tab2:
                         db = next(get_db())
                         try:
                             audio_record = AudioTranscription(
-                                音声ファイルpath=result["ファイル名"],
+                                音声ファイルpath=mic_filename,
+                                音声ファイル格納パス=stored_path,
+                                ファイルサイズ=file_size,
                                 発言人数=1,
                                 録音時刻=timestamp,
                                 録音時間=duration,
@@ -419,6 +493,27 @@ with tab2:
                             db.add(audio_record)
                             db.commit()
                             logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
+                            
+                            # ベクトルDBに追加
+                            try:
+                                search_engine = get_semantic_search_engine()
+                                doc_id = f"audio_{audio_record.音声ID}"
+                                metadata = {
+                                    "audio_id": audio_record.音声ID,
+                                    "file_path": mic_filename,
+                                    "recording_time": timestamp.isoformat(),
+                                    "duration": duration,
+                                    "speakers": 1,
+                                    "tags": tags or ""
+                                }
+                                if structured_data:
+                                    metadata["structured_data"] = str(structured_data)
+                                
+                                search_engine.add_document(doc_id, transcription, metadata)
+                                logger.info(f"Added to vector DB: {doc_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to add to vector DB: {str(e)}")
+                                
                         finally:
                             db.close()
                         
@@ -544,6 +639,42 @@ with tab4:
                             st.write(f"**録音時間:** {record.録音時間}秒")
                             st.write(f"**タグ:** {record.タグ}")
                             
+                            # ファイルサイズ表示
+                            if record.ファイルサイズ:
+                                file_size_mb = record.ファイルサイズ / 1024 / 1024
+                                st.write(f"**ファイルサイズ:** {file_size_mb:.2f} MB")
+                            
+                            # 音声ファイルの再生・ダウンロード
+                            if record.音声ファイル格納パス:
+                                audio_storage = get_audio_storage()
+                                stored_path = audio_storage.get_audio_file_path(record.音声ファイル格納パス)
+                                
+                                if stored_path:
+                                    st.subheader("🔊 音声ファイル")
+                                    
+                                    # 音声ファイルを読み込んで再生
+                                    try:
+                                        with open(stored_path, "rb") as audio_file:
+                                            audio_bytes = audio_file.read()
+                                            st.audio(audio_bytes, format="audio/wav")
+                                            
+                                            # ダウンロードボタン
+                                            file_ext = Path(record.音声ファイルpath).suffix
+                                            mime_type = "audio/wav" if file_ext == ".wav" else "audio/mpeg"
+                                            st.download_button(
+                                                label="📥 音声ファイルをダウンロード",
+                                                data=audio_bytes,
+                                                file_name=record.音声ファイルpath,
+                                                mime=mime_type
+                                            )
+                                    except Exception as e:
+                                        st.error(f"音声ファイルの読み込みエラー: {str(e)}")
+                                        logger.error(f"Audio file read error: {str(e)}")
+                                else:
+                                    st.warning("⚠️ 音声ファイルが見つかりません")
+                            else:
+                                st.info("💡 この記録には音声ファイルが保存されていません")
+                            
                             st.subheader("文字起こしテキスト")
                             st.text_area("", record.文字起こしテキスト, height=200)
                         
@@ -551,6 +682,8 @@ with tab4:
                             if record.構造化データ:
                                 st.subheader("構造化データ")
                                 st.json(record.構造化データ)
+                            else:
+                                st.info("構造化データはありません")
         else:
             st.info("データベースにレコードがありません。")
     finally:
