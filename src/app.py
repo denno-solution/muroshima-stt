@@ -412,18 +412,12 @@ with tab2:
     audio_bytes = st.audio_input("🎙️ マイクで録音してください", help="録音ボタンを押して音声を録音し、停止ボタンで録音を終了してください")
     
     if audio_bytes:
-        # 新しい録音があれば保存
+        # 新しい録音があれば自動的に処理を開始
         if audio_bytes != st.session_state.mic_audio_bytes:
             st.session_state.mic_audio_bytes = audio_bytes
-            st.session_state.mic_processing = False
-        
-        st.success("録音完了！")
-        
-        # 確認ダイアログ
-        if not st.session_state.mic_processing:
-            if st.button("🚀 文字起こしてデータベースに保存しますか？", type="primary", key="mic_process_button"):
-                st.session_state.mic_processing = True
-                st.rerun()
+            st.session_state.mic_processing = True
+            st.success("📁 録音完了！文字起こしを開始します...")
+            st.rerun()
         
         # 録音データを処理
         if st.session_state.mic_processing:
@@ -569,8 +563,7 @@ with tab2:
     
     st.divider()
     st.markdown("**💡 使い方のヒント:**")
-    st.markdown("- 録音ボタンを押してから話してください")
-    st.markdown("- 録音終了後、「文字起こして保存」ボタンをクリック")
+    st.markdown("- 録音ボタンを押してから話し、停止ボタンを押して録音を終了してください")
     st.markdown("- 録音データは一時的に保存され、処理後に削除されます")
 
 with tab3:
@@ -657,6 +650,9 @@ with tab4:
                             if record.構造化データ:
                                 st.subheader("構造化データ")
                                 st.json(record.構造化データ)
+                            
+            
+        
         else:
             st.info("データベースにレコードがありません。")
     finally:
