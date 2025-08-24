@@ -550,98 +550,186 @@ with tab4:
         st.subheader("🤖 AI質問応答")
         st.markdown("**議事録に関する質問を自然言語で入力してください。AIが関連する情報を検索して回答します。**")
         
-        # 質問入力
-        question = st.text_area(
-            "質問を入力してください",
-            placeholder="例：\n・予算削減についてこれまでどのような議論がありましたか？\n・人事制度の見直しで決まったことを教えてください\n・プロジェクトの進捗状況はどうなっていますか？",
-            height=100,
-            help="具体的で明確な質問ほど、正確な回答が得られます。"
-        )
+        # 設定オプション（サイドバーに移動）
+        with st.sidebar:
+            st.markdown("### ⚙️ AI質問応答設定")
+            max_sources = st.selectbox("参照する記録数", [3, 5, 8, 10], index=1, key="rag_max_sources")
+            min_similarity = st.slider("類似度閾値", 0.3, 0.9, 0.5, 0.1, key="rag_min_similarity")
+            show_sources = st.checkbox("参照ソースを表示", value=True, key="rag_show_sources")
+            
+            # チャット履歴のクリアボタン
+            if st.button("🗑️ チャット履歴をクリア", key="clear_chat"):
+                st.session_state.rag_messages = []
+                st.rerun()
         
-        # 設定オプション
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            max_sources = st.selectbox("参照する記録数", [3, 5, 8, 10], index=1)
-        with col2:
-            min_similarity = st.slider("類似度閾値", 0.3, 0.9, 0.5, 0.1)
-        with col3:
-            show_sources = st.checkbox("参照ソースを表示", value=True)
+        # チャット履歴の初期化
+        if "rag_messages" not in st.session_state:
+            st.session_state.rag_messages = []
+            # ウェルカムメッセージ
+            st.session_state.rag_messages.append({
+                "role": "assistant",
+                "content": "こんにちは！ 録音データに関する質問にお答えします。どのようなことをお知りになりたいですか？\n\n例えば：\n- 「予算削減についてこれまでどのような議論がありましたか？」\n- 「人事制度の見直しで決まったことを教えてください」\n- 「プロジェクトの進捗状況はどうなっていますか？」"
+            })
         
-        if question and question.strip():
-            try:
-                # RAG質問応答システムを取得
-                rag_system = get_rag_qa_system()
-                
-                # 質問応答実行
-                with st.spinner("🔍 関連情報を検索してAIが回答を生成中..."):
-                    result = rag_system.answer_question(
-                        question=question.strip(),
-                        max_context_docs=max_sources,
-                        min_similarity=min_similarity
-                    )
-                
-                # 回答表示
-                st.markdown("### 💬 AI回答")
-                
-                # 信頼度に応じてスタイル変更
-                confidence = result.get('confidence', 0.0)
-                if confidence >= 0.7:
-                    st.success("🎯 高信頼度の回答")
-                elif confidence >= 0.5:
-                    st.info("📝 中程度の信頼度")
+        # チャット履歴の表示
+        for message in st.session_state.rag_messages:
+            with st.chat_message(message["role"]):
+                if message["role"] == "user":
+                    st.markdown(message["content"])
                 else:
-                    st.warning("⚠️ 低信頼度（参考程度）")
-                
-                # 回答本文
-                st.markdown(result['answer'])
-                
-                # メタデータ表示
-                metadata = result.get('metadata', {})
-                col_meta1, col_meta2, col_meta3 = st.columns(3)
-                with col_meta1:
-                    st.metric("信頼度", f"{confidence:.1%}")
-                with col_meta2:
-                    st.metric("検索件数", metadata.get('search_count', 0))
-                with col_meta3:
-                    st.metric("参照記録", len(result.get('sources', [])))
-                
-                # 参照ソース表示
-                if show_sources and result.get('sources'):
-                    st.markdown("### 📚 参照した音声記録")
+                    st.markdown(message["content"])
                     
-                    for i, source in enumerate(result['sources'], 1):
-                        with st.expander(f"📄 音声記録 {i} - ID {source.get('audio_id', 'Unknown')} (類似度: {source.get('similarity_score', 0):.3f})"):
-                            col_src1, col_src2 = st.columns(2)
-                            
-                            with col_src1:
-                                st.markdown(f"**📁 ファイル:** {source.get('file_path', 'N/A')}")
-                                recording_time = source.get('recording_time', '')
-                                if recording_time:
-                                    st.markdown(f"**📅 録音時刻:** {recording_time[:19]}")
-                            
-                            with col_src2:
-                                st.markdown(f"**🎯 類似度:** {source.get('similarity_score', 0):.3f}")
-                            
-                            st.markdown("**📝 内容:**")
-                            st.write(source.get('excerpt', ''))
-                
-                # エラー情報がある場合は表示
-                if 'error' in metadata:
-                    st.error(f"エラー詳細: {metadata['error']}")
+                    # 参照ソースがある場合は表示
+                    if "sources" in message and show_sources and message["sources"]:
+                        with st.expander("📚 参照した音声記録", expanded=False):
+                            for i, source in enumerate(message["sources"], 1):
+                                st.markdown(f"**📄 記録 {i}** - ID {source.get('audio_id', 'Unknown')}")
+                                col_src1, col_src2 = st.columns(2)
+                                with col_src1:
+                                    st.markdown(f"📁 {source.get('file_path', 'N/A')}")
+                                    recording_time = source.get('recording_time', '')
+                                    if recording_time:
+                                        st.markdown(f"📅 {recording_time[:19]}")
+                                with col_src2:
+                                    st.markdown(f"🎯 類似度: {source.get('similarity_score', 0):.3f}")
+                                
+                                # 内容の抜粋
+                                excerpt = source.get('excerpt', '')
+                                if excerpt:
+                                    st.markdown("📝 内容の抜粋:")
+                                    st.text(excerpt[:300] + "..." if len(excerpt) > 300 else excerpt)
+                                
+                                if i < len(message["sources"]):
+                                    st.markdown("---")
                     
-            except Exception as e:
-                st.error(f"質問応答エラー: {str(e)}")
-                logger.error(f"RAG QA error: {str(e)}")
+                    # メタデータがある場合は表示
+                    if "metadata" in message:
+                        metadata = message["metadata"]
+                        confidence = message.get("confidence", 0.0)
+                        
+                        with st.expander("📊 回答の詳細", expanded=False):
+                            col_meta1, col_meta2, col_meta3 = st.columns(3)
+                            with col_meta1:
+                                if confidence >= 0.7:
+                                    st.success(f"信頼度: {confidence:.1%}")
+                                elif confidence >= 0.5:
+                                    st.info(f"信頼度: {confidence:.1%}")
+                                else:
+                                    st.warning(f"信頼度: {confidence:.1%}")
+                            with col_meta2:
+                                st.metric("検索件数", metadata.get('search_count', 0))
+                            with col_meta3:
+                                st.metric("参照記録", len(message.get('sources', [])))
         
-        elif question and not question.strip():
-            st.info("質問を入力してください。")
+        # チャット入力
+        if prompt := st.chat_input("質問を入力してください..."):
+            # ユーザーメッセージを追加
+            st.session_state.rag_messages.append({"role": "user", "content": prompt})
+            
+            # ユーザーメッセージを表示
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # アシスタントの回答を生成
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 関連情報を検索してAIが回答を生成中..."):
+                    try:
+                        # RAG質問応答システムを取得
+                        rag_system = get_rag_qa_system()
+                        
+                        # 質問応答実行
+                        result = rag_system.answer_question(
+                            question=prompt.strip(),
+                            max_context_docs=max_sources,
+                            min_similarity=min_similarity
+                        )
+                        
+                        # 信頼度に応じたプレフィックスを追加
+                        confidence = result.get('confidence', 0.0)
+                        if confidence >= 0.7:
+                            confidence_prefix = "🎯 **高信頼度の回答**\n\n"
+                        elif confidence >= 0.5:
+                            confidence_prefix = "📝 **中程度の信頼度**\n\n"
+                        else:
+                            confidence_prefix = "⚠️ **低信頼度（参考程度）**\n\n"
+                        
+                        # 回答を表示
+                        answer_content = confidence_prefix + result['answer']
+                        st.markdown(answer_content)
+                        
+                        # セッション状態に回答を保存
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": answer_content,
+                            "sources": result.get('sources', []),
+                            "metadata": result.get('metadata', {}),
+                            "confidence": confidence
+                        }
+                        st.session_state.rag_messages.append(assistant_message)
+                        
+                        # 参照ソースの表示
+                        if show_sources and result.get('sources'):
+                            with st.expander("📚 参照した音声記録", expanded=True):
+                                for i, source in enumerate(result['sources'], 1):
+                                    st.markdown(f"**📄 記録 {i}** - ID {source.get('audio_id', 'Unknown')}")
+                                    col_src1, col_src2 = st.columns(2)
+                                    with col_src1:
+                                        st.markdown(f"📁 {source.get('file_path', 'N/A')}")
+                                        recording_time = source.get('recording_time', '')
+                                        if recording_time:
+                                            st.markdown(f"📅 {recording_time[:19]}")
+                                    with col_src2:
+                                        st.markdown(f"🎯 類似度: {source.get('similarity_score', 0):.3f}")
+                                    
+                                    # 内容の抜粋
+                                    excerpt = source.get('excerpt', '')
+                                    if excerpt:
+                                        st.markdown("📝 内容の抜粋:")
+                                        st.text(excerpt[:300] + "..." if len(excerpt) > 300 else excerpt)
+                                    
+                                    if i < len(result["sources"]):
+                                        st.markdown("---")
+                        
+                        # メタデータの表示
+                        metadata = result.get('metadata', {})
+                        with st.expander("📊 回答の詳細", expanded=True):
+                            col_meta1, col_meta2, col_meta3 = st.columns(3)
+                            with col_meta1:
+                                if confidence >= 0.7:
+                                    st.success(f"信頼度: {confidence:.1%}")
+                                elif confidence >= 0.5:
+                                    st.info(f"信頼度: {confidence:.1%}")
+                                else:
+                                    st.warning(f"信頼度: {confidence:.1%}")
+                            with col_meta2:
+                                st.metric("検索件数", metadata.get('search_count', 0))
+                            with col_meta3:
+                                st.metric("参照記録", len(result.get('sources', [])))
+                            
+                            # エラー情報がある場合は表示
+                            if 'error' in metadata:
+                                st.error(f"エラー詳細: {metadata['error']}")
+                    
+                    except Exception as e:
+                        error_message = f"❌ 質問応答エラー: {str(e)}"
+                        st.error(error_message)
+                        logger.error(f"RAG QA error: {str(e)}")
+                        
+                        # エラーメッセージもセッション状態に保存
+                        st.session_state.rag_messages.append({
+                            "role": "assistant",
+                            "content": error_message
+                        })
         
-        # 使い方のヒント
-        st.markdown("---")
-        st.markdown("**💡 使い方のコツ:**")
-        st.markdown("- 具体的な質問ほど正確な回答が得られます")
-        st.markdown("- 「いつ」「誰が」「何を」を含めると効果的です")
-        st.markdown("- 複数のトピックを一度に聞くより、個別に質問してください")
+        # 使い方のヒント（下部に配置）
+        with st.expander("💡 使い方のコツ", expanded=False):
+            st.markdown("""
+            - **具体的な質問**ほど正確な回答が得られます
+            - **「いつ」「誰が」「何を」**を含めると効果的です
+            - **複数のトピック**を一度に聞くより、個別に質問してください
+            - **会話の履歴**が保持されるので、前の質問を参照した追加質問も可能です
+            - **設定の調整**：サイドバーで参照記録数や類似度閾値を調整できます
+            """)
 
     with search_tab2:
         st.subheader("💭 意味検索")
