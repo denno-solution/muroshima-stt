@@ -60,10 +60,10 @@ def transcribe_audio_file(audio_file_path, language_code=None):
         logger.error(f"ファイル情報取得エラー: {e}")
     
     try:
-        # ElevenLabsクライアントの初期化
+        # ElevenLabsクライアントの初期化（タイムアウトを30分に設定）
         logger.debug("ElevenLabsクライアントを初期化中...")
-        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-        logger.debug("ElevenLabsクライアントの初期化完了")
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY, timeout=1800.0)
+        logger.debug("ElevenLabsクライアントの初期化完了（タイムアウト: 1800秒）")
         
         logger.info(f"文字起こしを実行中: {Path(audio_file_path).name}")
         

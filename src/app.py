@@ -343,26 +343,37 @@ with tab2:
         # 録音データを処理
         if st.session_state.mic_processing:
             try:
-                # 一時ファイルとして保存
+                # 一時ファイルとして保存（WebM形式）
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
                     # audio_bytesがUploadedFileオブジェクトの場合はgetvalue()でバイト列を取得
                     if hasattr(audio_bytes, 'getvalue'):
                         tmp_file.write(audio_bytes.getvalue())
                     else:
                         tmp_file.write(audio_bytes)
-                    tmp_path = tmp_file.name
+                    webm_path = tmp_file.name
                 
-                logger.info(f"マイク録音処理開始: {tmp_path}")
+                logger.info(f"マイク録音処理開始: {webm_path}")
                 
-                # 音声ファイルの情報取得
+                # WebMをWAVに変換（STT API互換性向上）
                 try:
-                    audio_data, sr = librosa.load(tmp_path, sr=None)
+                    audio_data, sr = librosa.load(webm_path, sr=16000)  # 16kHzに統一
                     duration = len(audio_data) / sr
+                    
+                    # WAV形式で保存
+                    wav_path = webm_path.replace('.webm', '.wav')
+                    sf.write(wav_path, audio_data, sr)
+                    tmp_path = wav_path
+                    
+                    # 元のWebMファイルは削除
+                    os.unlink(webm_path)
+                    
+                    logger.info(f"音声変換完了: WebM → WAV ({wav_path})")
                     logger.debug(f"録音音声情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
                 except Exception as e:
-                    # librosaで読み込めない場合のフォールバック
+                    # 変換失敗の場合はWebMファイルをそのまま使用
+                    tmp_path = webm_path
                     duration = 0.0
-                    logger.warning(f"音声情報取得失敗（処理は継続）: {e}")
+                    logger.warning(f"音声変換失敗（WebMで処理継続）: {e}")
                 
                 # STTモデルの初期化
                 stt_wrapper = STTModelWrapper(selected_model)
@@ -392,8 +403,9 @@ with tab2:
                         
                         # 結果を保存
                         timestamp = datetime.now()
+                        file_extension = ".wav" if tmp_path.endswith('.wav') else ".webm"
                         result = {
-                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}.webm",
+                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}",
                             "録音時刻": timestamp,
                             "録音時間": duration,
                             "文字起こしテキスト": transcription,
@@ -443,7 +455,16 @@ with tab2:
                         # エラーメッセージがある場合は詳細を表示
                         if error_msg:
                             st.error(f"❌ マイク録音の文字起こしに失敗しました")
-                            st.error(f"エラー詳細: {error_msg}")
+                            
+                            # API認証エラーの場合は解決策を提示
+                            if "invalid_api_key" in str(error_msg).lower():
+                                st.error("🔑 APIキーが無効です")
+                                st.info("💡 **解決方法**: サイドバーで別のSTTモデル（OpenAI、Google Cloud等）に切り替えるか、APIキーを確認してください。")
+                            elif "internal server error" in str(error_msg).lower():
+                                st.error("🔧 サーバーで一時的な問題が発生しました")
+                                st.info("💡 **解決方法**: 数分後に再試行するか、別のSTTモデルに切り替えてください。")
+                            else:
+                                st.error(f"エラー詳細: {error_msg}")
                         else:
                             st.error("❌ マイク録音の文字起こしに失敗しました（結果が空）")
                 
