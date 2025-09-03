@@ -9,6 +9,58 @@ import librosa
 import soundfile as sf
 from dotenv import load_dotenv
 import logging
+import uuid
+
+# Supabase Storage 用
+def _get_supabase_client():
+    try:
+        from supabase import create_client  # type: ignore
+    except Exception:
+        return None
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Supabaseクライアント初期化に失敗: {e}")
+        return None
+
+def upload_audio_to_supabase(local_path: str, *, content_type: str) -> dict | None:
+    """音声ファイルをSupabase Storageにアップロード。
+    成功時は {bucket, path, public_url} を返す。失敗時はNone。
+    """
+    sb = _get_supabase_client()
+    bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "stt-audio")
+    if not sb:
+        return None
+    # 保存パス: recordings/YYYY/MM/DD/<uuid>.ext
+    now = datetime.utcnow()
+    ext = Path(local_path).suffix.lower() or ".wav"
+    unique = uuid.uuid4().hex
+    dest_path = f"recordings/{now:%Y/%m/%d}/{unique}{ext}"
+    try:
+        with open(local_path, "rb") as f:
+            # x-upsert を true にして同名時も上書き
+            sb.storage.from_(bucket).upload(
+                dest_path,
+                f,
+                {"content-type": content_type, "x-upsert": "true"},
+            )
+        # 公開URL（バケットがPublicの場合のみ有効）
+        public_url = None
+        try:
+            public_url = sb.storage.from_(bucket).get_public_url(dest_path)
+        except Exception:
+            public_url = None
+        return {"bucket": bucket, "path": dest_path, "public_url": public_url}
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Supabase Storage アップロード失敗: {e}")
+        return None
+import hashlib
 
 # .envファイルを読み込む
 load_dotenv()
@@ -327,18 +379,30 @@ with tab2:
     audio_bytes = st.audio_input("🎙️ マイクで録音してください", help="録音ボタンを押して音声を録音し、停止ボタンで録音を終了してください")
     
     if audio_bytes:
-        # 新しい録音があれば保存
-        if audio_bytes != st.session_state.mic_audio_bytes:
-            st.session_state.mic_audio_bytes = audio_bytes
-            st.session_state.mic_processing = False
-        
+        # 録音完了を通知
         st.success("録音完了！")
-        
-        # 確認ダイアログ
-        if not st.session_state.mic_processing:
-            if st.button("🚀 文字起こしてデータベースに保存しますか？", type="primary", key="mic_process_button"):
-                st.session_state.mic_processing = True
-                st.rerun()
+
+        # 録音内容のダイジェストを算出して重複処理を防止
+        try:
+            raw = audio_bytes.getvalue() if hasattr(audio_bytes, 'getvalue') else audio_bytes
+            current_digest = hashlib.md5(raw).hexdigest()
+        except Exception:
+            current_digest = None
+
+        # 新規録音判定（ハッシュ優先、失敗時はオブジェクト比較にフォールバック）
+        is_new_recording = False
+        if current_digest is not None:
+            is_new_recording = st.session_state.get("mic_last_digest") != current_digest
+        else:
+            is_new_recording = audio_bytes != st.session_state.get("mic_audio_bytes")
+
+        # 新規録音なら自動で処理開始
+        if not st.session_state.get("mic_processing") and is_new_recording:
+            st.session_state.mic_audio_bytes = audio_bytes
+            st.session_state.mic_processing = True
+            st.session_state.mic_last_digest = current_digest
+            st.info("自動で文字起こしを開始します…")
+            st.rerun()
         
         # 録音データを処理
         if st.session_state.mic_processing:
@@ -375,6 +439,19 @@ with tab2:
                     duration = 0.0
                     logger.warning(f"音声変換失敗（WebMで処理継続）: {e}")
                 
+                # Supabase Storage にアップロード（録音時保存）
+                try:
+                    content_type = "audio/wav" if tmp_path.endswith('.wav') else "audio/webm"
+                    upload_res = upload_audio_to_supabase(tmp_path, content_type=content_type)
+                    if upload_res:
+                        logger.info(
+                            f"Supabase Storage へアップロード完了: {upload_res['bucket']}/{upload_res['path']}"
+                        )
+                    else:
+                        logger.warning("Supabase Storage へのアップロードをスキップ/失敗（環境未設定またはエラー）")
+                except Exception as e:
+                    logger.error(f"Supabase Storage アップロード処理で例外: {e}")
+
                 # STTモデルの初期化
                 stt_wrapper = STTModelWrapper(selected_model)
                 text_structurer = TextStructurer() if use_structuring else None
@@ -404,8 +481,13 @@ with tab2:
                         # 結果を保存
                         timestamp = datetime.now()
                         file_extension = ".wav" if tmp_path.endswith('.wav') else ".webm"
+                        # DB保存用のファイルパスは、アップロード成功時はURLまたはストレージパスにする
+                        storage_path = None
+                        if 'upload_res' in locals() and upload_res:
+                            storage_path = upload_res.get("public_url") or f"{upload_res['bucket']}/{upload_res['path']}"
+
                         result = {
-                            "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}",
+                            "ファイル名": storage_path or f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}",
                             "録音時刻": timestamp,
                             "録音時間": duration,
                             "文字起こしテキスト": transcription,
@@ -472,7 +554,7 @@ with tab2:
                     os.unlink(tmp_path)
                     logger.debug(f"一時ファイル削除: {tmp_path}")
                     
-                    # 処理完了後、状態をリセット
+                    # 処理完了後、状態をリセット（最終ダイジェストは維持して再処理を防止）
                     st.session_state.mic_processing = False
                     st.session_state.mic_audio_bytes = None
                     
@@ -485,7 +567,7 @@ with tab2:
     st.divider()
     st.markdown("**💡 使い方のヒント:**")
     st.markdown("- 録音ボタンを押してから話してください")
-    st.markdown("- 録音終了後、「文字起こして保存」ボタンをクリック")
+    st.markdown("- 録音終了後は自動で文字起こしを開始します")
     st.markdown("- 録音データは一時的に保存され、処理後に削除されます")
 
 with tab3:
