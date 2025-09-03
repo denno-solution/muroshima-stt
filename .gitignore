@@ -39,3 +39,6 @@ transcriptions/
 
 # Coding Agent
 .claude/
+
+# Local vector DB cache (not used by app)
+chroma_db/
