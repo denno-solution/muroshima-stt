@@ -22,7 +22,18 @@ def run_rag_tab():
     if "rag_history" not in st.session_state:
         st.session_state.rag_history = []
 
-    top_k = st.slider("検索するチャンク数", min_value=3, max_value=10, value=5)
+    top_k = int(
+        st.number_input(
+            "検索するチャンク数",
+            min_value=1,
+            value=5,
+            step=1,
+            help="チャンク数を多くするとリコールは上がりますが、レスポンス時間やコストも増加します。",
+        )
+    )
+
+    if top_k > 50:
+        st.warning("50件を超える検索は応答が遅くなる可能性があります。必要に応じて数を見直してください。")
 
     cols = st.columns([1, 1, 1])
     with cols[0]:
