@@ -1,6 +1,6 @@
 import streamlit as st
 
-from models import get_db
+from models import AudioTranscriptionChunk, get_db
 from services.rag_service import get_rag_service
 
 
@@ -22,11 +22,19 @@ def run_rag_tab():
     if "rag_history" not in st.session_state:
         st.session_state.rag_history = []
 
+    db = next(get_db())
+    try:
+        chunk_count = db.query(AudioTranscriptionChunk.id).count()
+    finally:
+        db.close()
+
+    default_top_k = max(chunk_count, 1)
+
     top_k = int(
         st.number_input(
             "検索するチャンク数",
             min_value=1,
-            value=5,
+            value=default_top_k,
             step=1,
             help="チャンク数を多くするとリコールは上がりますが、レスポンス時間やコストも増加します。",
         )
