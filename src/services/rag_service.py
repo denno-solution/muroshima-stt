@@ -34,6 +34,13 @@ HYBRID_DEFAULT_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))  # ベクト�
 HYBRID_CAND_MULT = int(os.getenv("RAG_HYBRID_CAND_MULT", "3"))  # 候補母集団の拡大係数
 ENABLE_FTS = os.getenv("ENABLE_FTS", "true").lower() in {"1", "true", "yes", "on"}
 
+# Prompt safety limits（環境変数で調整可能）
+CONTEXT_MAX_CHUNKS = int(os.getenv("RAG_CONTEXT_MAX_CHUNKS", "12"))
+CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONTEXT_MAX_CHARS", "20000"))  # おおよそ数千トークン相当
+
+# Retrieval breadth（検索候補の母集団サイズ）。インデックスは常に全体を対象に上位を返します。
+RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "100"))
+
 
 class RAGService:
     """埋め込み管理と検索ロジック。pgvector/libSQL双方で動作。"""
@@ -411,19 +418,63 @@ class RAGService:
             matches.append(rec)
         return matches
 
-    def answer(self, db: Session, query: str, top_k: int = 5, hybrid: bool = False, alpha: float = HYBRID_DEFAULT_ALPHA) -> Dict:
-        matches = (
-            self.similarity_search_hybrid(db, query, top_k, alpha)
+    def answer(
+        self,
+        db: Session,
+        query: str,
+        top_k: int | None = None,
+        hybrid: bool = False,
+        alpha: float = HYBRID_DEFAULT_ALPHA,
+        context_k: int | None = None,
+    ) -> Dict:
+        # 取得する候補件数（検索母集団からの上位件数）。UIには出さない。
+        tk = int(top_k or RETRIEVAL_K)
+        matches_all = (
+            self.similarity_search_hybrid(db, query, tk, alpha)
             if hybrid
-            else self.similarity_search(db, query, top_k)
+            else self.similarity_search(db, query, tk)
         )
-        if not matches:
+        if not matches_all:
             return {"answer": "関連するテキストが見つかりませんでした。", "matches": []}
 
-        prompt = self._build_prompt(query, matches)
+        # プロンプト用に上限を適用（件数/文字数）
+        use_k = int(context_k or CONTEXT_MAX_CHUNKS)
+        selected: List[Dict] = []
+        used_chars = 0
+        for m in matches_all:
+            if len(selected) >= use_k:
+                break
+            txt = m.get("chunk_text") or ""
+            # ヘッダ分のメタ情報余白も少し見込む（+128）
+            add_len = len(txt) + 128
+            if used_chars + add_len > CONTEXT_MAX_CHARS:
+                break
+            selected.append(m)
+            used_chars += add_len
+
+        if not selected:
+            # どれも長すぎて入らない場合は最上位1件だけトリムして使用
+            head = matches_all[0]
+            trimmed = dict(head)
+            trimmed["chunk_text"] = (head.get("chunk_text") or "")[: max(200, CONTEXT_MAX_CHARS // 2)]
+            selected = [trimmed]
+
+        prompt = self._build_prompt(query, selected)
         answer = self._generate_answer(prompt)
 
-        return {"answer": answer, "matches": matches}
+        return {
+            "answer": answer,
+            "matches": selected,
+            "meta": {
+                "candidates": len(matches_all),
+                "used_context_chunks": len(selected),
+                "used_context_chars": used_chars,
+                "limits": {
+                    "max_chunks": use_k,
+                    "max_chars": CONTEXT_MAX_CHARS,
+                },
+            },
+        }
 
     def _similarity_search_libsql(
         self, db: Session, query_vector: List[float], top_k: int
@@ -559,7 +610,12 @@ class RAGService:
                 temperature=0.2,
             )
         except Exception as exc:  # pragma: no cover - APIエラー
-            logger.error("OpenAI chat_completions API 呼び出しで失敗: %s", exc)
+            msg = str(exc)
+            logger.error("OpenAI chat_completions API 呼び出しで失敗: %s", msg)
+            if "maximum context length" in msg or "context_length_exceeded" in msg or "too many tokens" in msg:
+                return (
+                    "回答生成時にプロンプトが長過ぎました。検索上限または 'RAG_CONTEXT_MAX_*' を下げて再実行してください。"
+                )
             return "回答生成中にエラーが発生しました。ログを確認してください。"
 
         choice = response.choices[0] if response.choices else None

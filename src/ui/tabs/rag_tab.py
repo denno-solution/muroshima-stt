@@ -32,27 +32,9 @@ def run_rag_tab():
     if "rag_history" not in st.session_state:
         st.session_state.rag_history = []
 
-    db = next(get_db())
-    try:
-        chunk_count = db.query(AudioTranscriptionChunk.id).count()
-    finally:
-        db.close()
-
-    # 既定値は控えめに（負荷回避）。データ量に応じて調整。
-    default_top_k = max(min(10, chunk_count), 1)
-
-    top_k = int(
-        st.number_input(
-            "検索するチャンク数",
-            min_value=1,
-            value=default_top_k,
-            step=1,
-            help="チャンク数を多くするとリコールは上がりますが、レスポンス時間やコストも増加します。",
-        )
-    )
-
-    if top_k > 50:
-        st.warning("50件を超える検索は応答が遅くなる可能性があります。必要に応じて数を見直してください。")
+    # 検索は常に全データ対象（ベクトル/FTSインデックスは全体から上位を返す）。
+    # 候補取得件数（top_k）は内部既定値で固定し、UIでは非表示。
+    st.caption("検索は全データから上位候補を自動抽出します（設定不要）。")
 
     # ハイブリッド検索オプション
     default_alpha = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))
@@ -79,6 +61,8 @@ def run_rag_tab():
             step=0.05,
             help="1.0でベクトルのみ、0.0でFTSのみ。既定は0.6。",
         )
+    # 回答に使うチャンク上限は内部既定値（RAG_CONTEXT_MAX_CHUNKS）で固定。UIでは非表示。
+    context_k = None
 
     for message in st.session_state.rag_history:
         block = st.chat_message(message["role"])
@@ -107,7 +91,9 @@ def run_rag_tab():
     with st.spinner("関連チャンクを検索中..."):
         db = next(get_db())
         try:
-            result = rag_service.answer(db, query, top_k=top_k, hybrid=use_hybrid, alpha=alpha)
+            result = rag_service.answer(
+                db, query, top_k=None, hybrid=use_hybrid, alpha=alpha, context_k=context_k
+            )
         finally:
             db.close()
 
@@ -143,3 +129,10 @@ def run_rag_tab():
                     )
                 st.write(ctx["chunk_text"])
                 st.divider()
+
+    # 実際の使用件数などのメタ情報を簡単に表示
+    meta = result.get("meta") if isinstance(result, dict) else None
+    if meta:
+        st.caption(
+            f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
+        )
