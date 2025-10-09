@@ -125,6 +125,7 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
 
                 # R2へアップロード（必要なら）
                 r2_info = None
+                r2_upload_ok = False
                 if save_to_r2:
                     cfg = load_r2_config_from_env()
                     if cfg is None:
@@ -135,6 +136,7 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                             source_path = final_path or tmp_path
                             key = final_filename
                             r2_info = upload_file_to_r2(source_path, key, cfg)
+                            r2_upload_ok = True
                             logger.info(f"R2アップロード成功: s3://{r2_info['bucket']}/{r2_info['key']}")
                         except Exception as exc:
                             logger.error(f"R2アップロード失敗: {exc}")
@@ -149,6 +151,9 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                     "発言人数": 1,
                     "保存先": final_path,
                     "r2_url": (r2_info or {}).get("url") if (r2_info) else None,
+                    "r2_bucket": (r2_info or {}).get("bucket") if (r2_info) else None,
+                    "r2_key": (r2_info or {}).get("key") if (r2_info) else None,
+                    "r2_ok": r2_upload_ok,
                 }
 
                 st.session_state.transcriptions.append(result)
@@ -202,10 +207,18 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                     else:
                         st.info("ローカル保存は無効です（SAVE_MIC_AUDIO_LOCAL=false）")
 
-                    if save_to_r2 and result.get("r2_url"):
-                        st.success(f"R2 URL: {result['r2_url']}")
-                    elif save_to_r2:
-                        st.warning("R2アップロードに失敗またはURL未設定（R2_PUBLIC_BASE_URL）")
+                    if save_to_r2:
+                        if result.get("r2_ok"):
+                            # アップロード自体は成功
+                            bucket = result.get("r2_bucket")
+                            key = result.get("r2_key")
+                            st.success(f"R2アップロード成功: s3://{bucket}/{key}")
+                            if result.get("r2_url"):
+                                st.success(f"公開URL: {result['r2_url']}")
+                            else:
+                                st.info("共有URLは未設定です（R2_PUBLIC_BASE_URL を設定するとURLを表示できます）")
+                        else:
+                            st.error("R2アップロードに失敗しました。ログを確認してください。")
                     else:
                         st.info("R2アップロードは無効です（SAVE_MIC_AUDIO_TO_R2=false）")
             else:
