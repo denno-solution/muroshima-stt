@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from elevenlabs import ElevenLabs
+import re
 import logging
 from dotenv import load_dotenv
 
@@ -31,12 +32,34 @@ file_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-# ElevenLabs設定
+# ElevenLabs設定（環境変数で挙動を制御可能）
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "scribe_v1")
+# 既定は日本語に固定（UI 経由の呼び出しは従来言語未指定で自動判定だった）
+ELEVENLABS_DEFAULT_LANG = os.getenv("ELEVENLABS_LANGUAGE_CODE", "ja")
+ELEVENLABS_TAG_EVENTS = os.getenv("ELEVENLABS_TAG_AUDIO_EVENTS", "false").lower() in ("1", "true", "yes", "on")
 
 if not ELEVENLABS_API_KEY:
     logger.warning("ELEVENLABS_API_KEY環境変数が設定されていません。")
     ELEVENLABS_API_KEY = "your-api-key"
+
+def _clean_transcript(text: str) -> str:
+    """簡易クレンジング: 典型的なイベントタグやノイズ表現を除去。
+    極力保守的に ASCII のイベント語のみ対象にする。
+    """
+    if not text:
+        return text
+    patterns = [
+        r"[\[\(<]{1}\s*(laughter|applause|music|noise|inaudible|cough|sigh|breath|laughs|claps?)\s*[\)\]>]{1}",
+        r"<\/?(applause|music|noise)>",
+    ]
+    out = text
+    for pat in patterns:
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    # 連続スペースの正規化
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
+
 
 def transcribe_audio_file(audio_file_path, language_code=None):
     """ElevenLabs Scribeで音声ファイルを文字起こしする
@@ -76,14 +99,16 @@ def transcribe_audio_file(audio_file_path, language_code=None):
             # APIパラメータを構築
             api_params = {
                 "file": audio_file,
-                "model_id": "scribe_v1",  # または "scribe_v1_experimental"
-                "tag_audio_events": True  # 笑い声、拍手などの非音声イベントもタグ付け
+                "model_id": ELEVENLABS_MODEL_ID,  # 既定は "scribe_v1"（env で上書き可）
+                "tag_audio_events": ELEVENLABS_TAG_EVENTS,
             }
             
             # language_codeが指定されていて、空文字列でない場合のみ追加
-            if language_code and language_code.strip():
-                api_params["language_code"] = language_code
-                logger.debug(f"言語コードを指定: {language_code}")
+            # 言語コード: 明示指定が無ければ既定（ELEVENLABS_LANGUAGE_CODE）を使う
+            effective_lang = (language_code or "").strip() or ELEVENLABS_DEFAULT_LANG
+            if effective_lang:
+                api_params["language_code"] = effective_lang
+                logger.debug(f"言語コードを指定: {effective_lang}")
             else:
                 logger.debug("言語コードは自動検出モード")
             
@@ -91,15 +116,26 @@ def transcribe_audio_file(audio_file_path, language_code=None):
             logger.debug("API呼び出し完了")
         
         # 結果の処理
+        # 参考: 言語検出のダイアグノスティクスをログ
+        try:
+            detected_lang = getattr(result, "language_code", None)
+            lang_prob = getattr(result, "language_probability", None)
+            if detected_lang:
+                logger.debug(f"検出言語: {detected_lang} (prob={lang_prob})")
+        except Exception:
+            pass
+
         if result.text:
-            logger.info(f"文字起こし成功: {len(result.text)}文字")
-            return result.text
+            cleaned = _clean_transcript(result.text)
+            logger.info(f"文字起こし成功: {len(cleaned)}文字")
+            return cleaned
         else:
             # 結果が複数のセグメントに分かれている場合
             if hasattr(result, 'segments'):
-                transcription = " ".join([segment.text for segment in result.segments])
-                logger.info(f"文字起こし成功（セグメント結合）: {len(transcription)}文字")
-                return transcription
+                transcription = " ".join([getattr(segment, "text", "") for segment in result.segments]).strip()
+                cleaned = _clean_transcript(transcription)
+                logger.info(f"文字起こし成功（セグメント結合）: {len(cleaned)}文字")
+                return cleaned
             logger.warning("文字起こし結果が空です")
             return None
             
@@ -117,7 +153,7 @@ def save_transcription(filename, transcription, output_dir):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"ファイル名: {filename}\n")
         f.write(f"文字起こし日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"サービス: ElevenLabs (Scribe v1)\n")
+        f.write(f"サービス: ElevenLabs ({ELEVENLABS_MODEL_ID})\n")
         f.write("-" * 50 + "\n")
         f.write(transcription)
     
