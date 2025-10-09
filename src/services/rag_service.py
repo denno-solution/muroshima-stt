@@ -197,8 +197,16 @@ class RAGService:
         return self._blend_and_fetch_libsql(db, vec_rows, fts_rows, top_k, alpha)
 
     def _libsql_vector_candidates(self, db: Session, qvec: List[float], k: int) -> List[Dict]:
+        # libSQL の vector_top_k は距離を返さないため、基表に JOIN して
+        # vector_distance_cos で距離を計算してから返す。
         stmt = text(
-            "SELECT id, distance FROM vector_top_k(:index_name, vector32(:q), :k)"
+            """
+            SELECT
+                i.id AS id,
+                vector_distance_cos(chunk.embedding, vector32(:q)) AS distance
+            FROM vector_top_k(:index_name, vector32(:q), :k) AS i
+            JOIN audio_transcription_chunks AS chunk ON chunk.id = i.id
+            """
         )
         rows = db.execute(
             stmt,
@@ -491,11 +499,11 @@ class RAGService:
                 trans."タグ" AS tag,
                 trans."録音時刻" AS recorded_at,
                 trans."録音時間" AS duration,
-                matches.distance AS distance
+                vector_distance_cos(chunk.embedding, vector32(:query_vector)) AS distance
             FROM vector_top_k(:index_name, vector32(:query_vector), :top_k) AS matches
             JOIN audio_transcription_chunks AS chunk ON chunk.id = matches.id
             JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
-            ORDER BY matches.distance ASC
+            ORDER BY distance ASC
             """
         )
 
