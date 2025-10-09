@@ -8,7 +8,6 @@ from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 
 from services.audio_utils import md5_bytes, should_convert_to_wav, convert_webm_to_wav
-from services.storage import upload_audio_to_supabase
 from services.rag_service import get_rag_service
 
 
@@ -71,18 +70,8 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                 duration = 0.0
                 logger.warning(f"音声変換失敗（WebMで処理継続）: {e}")
 
-        # Supabase Storage へアップロード
-        try:
-            content_type = "audio/wav" if tmp_path.endswith('.wav') else "audio/webm"
-            upload_res = upload_audio_to_supabase(tmp_path, content_type=content_type)
-            if upload_res:
-                logger.info(
-                    f"Supabase Storage へアップロード完了: {upload_res['bucket']}/{upload_res['path']}"
-                )
-            else:
-                logger.warning("Supabase Storage へのアップロードをスキップ/失敗（環境未設定またはエラー）")
-        except Exception as e:
-            logger.error(f"Supabase Storage アップロード処理で例外: {e}")
+        # クラウドストレージ連携は削除（Supabase依存を排除）
+        storage_path = None
 
         # STT 実行
         stt_wrapper = STTModelWrapper(selected_model)
@@ -108,12 +97,8 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
 
                 timestamp = datetime.now()
                 file_extension = ".wav" if tmp_path.endswith('.wav') else ".webm"
-                storage_path = None
-                if 'upload_res' in locals() and upload_res:
-                    storage_path = upload_res.get("public_url") or f"{upload_res['bucket']}/{upload_res['path']}"
-
                 result = {
-                    "ファイル名": storage_path or f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}",
+                    "ファイル名": f"マイク録音_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}",
                     "録音時刻": timestamp,
                     "録音時間": duration,
                     "文字起こしテキスト": transcription,

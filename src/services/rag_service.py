@@ -1,17 +1,25 @@
-"""RAG（pgvector）向けの埋め込み生成と保存ロジック。"""
+"""RAG向けの埋め込み生成と保存ロジック。PostgresとTurso双方に対応。"""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 from openai import OpenAI
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from models import AudioTranscription, AudioTranscriptionChunk, EMBEDDING_DIM, USE_VECTOR
+from models import (
+    AudioTranscription,
+    AudioTranscriptionChunk,
+    EMBEDDING_DIM,
+    LIBSQL_VECTOR_INDEX_NAME,
+    USE_VECTOR,
+    VECTOR_BACKEND,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +29,18 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-4o-mini")
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in {"1", "true", "yes", "on"}
 
+# Hybrid search parameters
+HYBRID_DEFAULT_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))  # ベクトル寄り
+HYBRID_CAND_MULT = int(os.getenv("RAG_HYBRID_CAND_MULT", "3"))  # 候補母集団の拡大係数
+ENABLE_FTS = os.getenv("ENABLE_FTS", "true").lower() in {"1", "true", "yes", "on"}
+
 
 class RAGService:
-    """Supabase/pgvector向けの埋め込み管理。"""
+    """埋め込み管理と検索ロジック。pgvector/libSQL双方で動作。"""
 
     def __init__(self) -> None:
         self._enabled = bool(USE_VECTOR) and ENABLE_RAG
+        self._vector_backend = VECTOR_BACKEND
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             if self._enabled:
@@ -76,30 +90,35 @@ class RAGService:
 
         query_vector = query_embedding[0]
 
-        distance_expr = AudioTranscriptionChunk.embedding.cosine_distance(query_vector)
+        if self._vector_backend == "postgres":
+            distance_expr = AudioTranscriptionChunk.embedding.cosine_distance(query_vector)
 
-        stmt = (
-            select(
-                AudioTranscriptionChunk.id.label("chunk_id"),
-                AudioTranscriptionChunk.chunk_text.label("chunk_text"),
-                AudioTranscriptionChunk.chunk_index.label("chunk_index"),
-                AudioTranscription.音声ID.label("transcription_id"),
-                AudioTranscription.音声ファイルpath.label("file_path"),
-                AudioTranscription.タグ.label("tag"),
-                AudioTranscription.録音時刻.label("recorded_at"),
-                AudioTranscription.録音時間.label("duration"),
-                distance_expr.label("distance"),
+            stmt = (
+                select(
+                    AudioTranscriptionChunk.id.label("chunk_id"),
+                    AudioTranscriptionChunk.chunk_text.label("chunk_text"),
+                    AudioTranscriptionChunk.chunk_index.label("chunk_index"),
+                    AudioTranscription.音声ID.label("transcription_id"),
+                    AudioTranscription.音声ファイルpath.label("file_path"),
+                    AudioTranscription.タグ.label("tag"),
+                    AudioTranscription.録音時刻.label("recorded_at"),
+                    AudioTranscription.録音時間.label("duration"),
+                    distance_expr.label("distance"),
+                )
+                .select_from(AudioTranscriptionChunk)
+                .join(
+                    AudioTranscription,
+                    AudioTranscription.音声ID == AudioTranscriptionChunk.transcription_id,
+                )
+                .order_by(distance_expr)
+                .limit(top_k)
             )
-            .select_from(AudioTranscriptionChunk)
-            .join(
-                AudioTranscription,
-                AudioTranscription.音声ID == AudioTranscriptionChunk.transcription_id,
-            )
-            .order_by(distance_expr)
-            .limit(top_k)
-        )
 
-        rows = db.execute(stmt).mappings().all()
+            rows = db.execute(stmt).mappings().all()
+        elif self._vector_backend == "libsql":
+            rows = self._similarity_search_libsql(db, query_vector, top_k)
+        else:
+            return []
 
         matches: List[Dict] = []
         for row in rows:
@@ -122,8 +141,282 @@ class RAGService:
 
         return matches
 
-    def answer(self, db: Session, query: str, top_k: int = 5) -> Dict:
-        matches = self.similarity_search(db, query, top_k)
+    def similarity_search_hybrid(
+        self,
+        db: Session,
+        query: str,
+        top_k: int = 5,
+        alpha: float = HYBRID_DEFAULT_ALPHA,
+    ) -> List[Dict]:
+        """FTS × ベクトルのハイブリッド検索。
+
+        alpha: 0.0〜1.0（1.0でベクトルのみ、0.0でFTSのみ）
+        """
+        if not self.enabled or not ENABLE_FTS:
+            return self.similarity_search(db, query, top_k)
+
+        # 埋め込み生成
+        qvecs = self._embed_texts([query])
+        if not qvecs:
+            # ベクトルが使えない場合はFTSのみ
+            return self._similarity_search_hybrid_fts_only(db, query, top_k)
+        qvec = qvecs[0]
+
+        # 候補母集団の件数
+        cand_k = max(top_k * HYBRID_CAND_MULT, top_k)
+
+        if self._vector_backend == "postgres":
+            return self._hybrid_postgres(db, query, qvec, top_k, cand_k, alpha)
+        elif self._vector_backend == "libsql":
+            return self._hybrid_libsql(db, query, qvec, top_k, cand_k, alpha)
+        else:
+            return []
+
+    # --- libSQL (Turso) 実装 ---
+    def _hybrid_libsql(
+        self,
+        db: Session,
+        query: str,
+        query_vector: List[float],
+        top_k: int,
+        cand_k: int,
+        alpha: float,
+    ) -> List[Dict]:
+        # ベクトル候補
+        vec_rows = self._libsql_vector_candidates(db, query_vector, cand_k)
+        # FTS候補
+        fts_rows = self._libsql_fts_candidates(db, query, cand_k)
+
+        return self._blend_and_fetch_libsql(db, vec_rows, fts_rows, top_k, alpha)
+
+    def _libsql_vector_candidates(self, db: Session, qvec: List[float], k: int) -> List[Dict]:
+        stmt = text(
+            "SELECT id, distance FROM vector_top_k(:index_name, vector32(:q), :k)"
+        )
+        rows = db.execute(
+            stmt,
+            {"index_name": LIBSQL_VECTOR_INDEX_NAME, "q": json.dumps(qvec), "k": k},
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+    def _libsql_fts_candidates(self, db: Session, query: str, k: int) -> List[Dict]:
+        # FTS5: bm25は小さいほど良い。後で 1/(1+bm25) に変換
+        try:
+            stmt = text(
+                """
+                SELECT rowid AS id, bm25(audio_transcription_chunks_fts) AS bm25
+                FROM audio_transcription_chunks_fts
+                WHERE audio_transcription_chunks_fts MATCH :q
+                ORDER BY bm25 LIMIT :k
+                """
+            )
+            rows = db.execute(stmt, {"q": query, "k": k}).mappings().all()
+        except Exception:
+            # FTS未構成時のフォールバック（LIKE検索、スコアは一律0.5）
+            like_stmt = text(
+                "SELECT id, 0.5 AS like_score FROM audio_transcription_chunks WHERE chunk_text LIKE :pat LIMIT :k"
+            )
+            rows = db.execute(
+                like_stmt, {"pat": f"%{query}%", "k": k}
+            ).mappings().all()
+            # 互換のため bm25 に変換（0.5 -> s_fts=0.5 => bm25 ~1.0 とみなす）
+            rows = [
+                {"id": r["id"], "bm25": 1.0}
+                for r in rows
+            ]
+        return [dict(row) for row in rows]
+
+    def _blend_and_fetch_libsql(
+        self,
+        db: Session,
+        vec_rows: List[Dict],
+        fts_rows: List[Dict],
+        top_k: int,
+        alpha: float,
+    ) -> List[Dict]:
+        # 正規化と結合
+        vec_map = {int(r["id"]): float(1.0 - float(r["distance"])) for r in vec_rows}
+        fts_map = {int(r["id"]): float(1.0 / (1.0 + max(0.0, float(r["bm25"])))) for r in fts_rows}
+
+        ids = set(vec_map) | set(fts_map)
+        scored: List[Tuple[int, float, float, float]] = []
+        for cid in ids:
+            v = max(0.0, min(1.0, vec_map.get(cid, 0.0)))
+            f = max(0.0, min(1.0, fts_map.get(cid, 0.0)))
+            s = alpha * v + (1.0 - alpha) * f
+            scored.append((cid, s, v, f))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [cid for cid, _, _, _ in scored[:top_k]]
+        if not top_ids:
+            return []
+
+        # メタ情報取得
+        ids_sql = ",".join(str(int(i)) for i in top_ids)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    chunk.id AS chunk_id,
+                    chunk.chunk_text AS chunk_text,
+                    chunk.chunk_index AS chunk_index,
+                    trans."音声ID" AS transcription_id,
+                    trans."音声ファイルpath" AS file_path,
+                    trans."タグ" AS tag,
+                    trans."録音時刻" AS recorded_at,
+                    trans."録音時間" AS duration
+                FROM audio_transcription_chunks AS chunk
+                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+                WHERE chunk.id IN ({ids_sql})
+                """
+            )
+        ).mappings().all()
+
+        row_map = {int(r["chunk_id"]): r for r in rows}
+        matches: List[Dict] = []
+        for cid, s, v, f in scored[:top_k]:
+            base = row_map.get(int(cid))
+            if not base:
+                continue
+            rec = dict(base)
+            rec["score"] = float(s)
+            rec["score_vector"] = float(v)
+            rec["score_fts"] = float(f)
+            matches.append(rec)
+        return matches
+
+    def _similarity_search_hybrid_fts_only(self, db: Session, query: str, top_k: int) -> List[Dict]:
+        # ベクトルが使えない場合の単純FTS検索（libSQL想定）
+        rows = self._libsql_fts_candidates(db, query, top_k)
+        ids = [int(r["id"]) for r in rows]
+        if not ids:
+            return []
+        ids_sql = ",".join(str(int(i)) for i in ids)
+        meta = db.execute(
+            text(
+                f"""
+                SELECT
+                    chunk.id AS chunk_id,
+                    chunk.chunk_text AS chunk_text,
+                    chunk.chunk_index AS chunk_index,
+                    trans."音声ID" AS transcription_id,
+                    trans."音声ファイルpath" AS file_path,
+                    trans."タグ" AS tag,
+                    trans."録音時刻" AS recorded_at,
+                    trans."録音時間" AS duration
+                FROM audio_transcription_chunks AS chunk
+                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+                WHERE chunk.id IN ({ids_sql})
+                """
+            )
+        ).mappings().all()
+
+        row_map = {int(r["chunk_id"]): r for r in meta}
+        matches: List[Dict] = []
+        for r in rows[:top_k]:
+            base = row_map.get(int(r["id"]))
+            if not base:
+                continue
+            sim_fts = 1.0 / (1.0 + max(0.0, float(r.get("bm25", 1.0))))
+            rec = dict(base)
+            rec["score"] = float(sim_fts)
+            rec["score_vector"] = 0.0
+            rec["score_fts"] = float(sim_fts)
+            matches.append(rec)
+        return matches
+
+    # --- Postgres 実装（簡易版） ---
+    def _hybrid_postgres(
+        self,
+        db: Session,
+        query: str,
+        query_vector: List[float],
+        top_k: int,
+        cand_k: int,
+        alpha: float,
+    ) -> List[Dict]:
+        # ベクトル候補
+        distance_expr = AudioTranscriptionChunk.embedding.cosine_distance(query_vector)
+        vec_stmt = (
+            select(
+                AudioTranscriptionChunk.id.label("id"),
+                distance_expr.label("distance"),
+            )
+            .select_from(AudioTranscriptionChunk)
+            .order_by(distance_expr)
+            .limit(cand_k)
+        )
+        vec_rows = db.execute(vec_stmt).mappings().all()
+
+        # FTS候補（simple辞書、ts_rank_cdでスコア取得）
+        fts_stmt = text(
+            """
+            SELECT id, ts_rank_cd(to_tsvector('simple', chunk_text), plainto_tsquery('simple', :q)) AS rank
+            FROM audio_transcription_chunks
+            WHERE to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', :q)
+            ORDER BY rank DESC
+            LIMIT :k
+            """
+        )
+        fts_rows = db.execute(fts_stmt, {"q": query, "k": cand_k}).mappings().all()
+
+        # 正規化・結合
+        vec_map = {int(r["id"]): float(1.0 - float(r["distance"])) for r in vec_rows}
+        # ts_rank_cd は 0〜1 程度の値が返る想定
+        fts_map = {int(r["id"]): float(max(0.0, float(r["rank"]))) for r in fts_rows}
+
+        ids = set(vec_map) | set(fts_map)
+        scored: List[Tuple[int, float, float, float]] = []
+        for cid in ids:
+            v = max(0.0, min(1.0, vec_map.get(cid, 0.0)))
+            f = max(0.0, min(1.0, fts_map.get(cid, 0.0)))
+            s = alpha * v + (1.0 - alpha) * f
+            scored.append((cid, s, v, f))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [cid for cid, _, _, _ in scored[:top_k]]
+        if not top_ids:
+            return []
+
+        ids_sql = ",".join(str(int(i)) for i in top_ids)
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    chunk.id AS chunk_id,
+                    chunk.chunk_text AS chunk_text,
+                    chunk.chunk_index AS chunk_index,
+                    trans."音声ID" AS transcription_id,
+                    trans."音声ファイルpath" AS file_path,
+                    trans."タグ" AS tag,
+                    trans."録音時刻" AS recorded_at,
+                    trans."録音時間" AS duration
+                FROM audio_transcription_chunks AS chunk
+                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+                WHERE chunk.id IN ({ids_sql})
+                """
+            )
+        ).mappings().all()
+
+        row_map = {int(r["chunk_id"]): r for r in rows}
+        matches: List[Dict] = []
+        for cid, s, v, f in scored[:top_k]:
+            base = row_map.get(int(cid))
+            if not base:
+                continue
+            rec = dict(base)
+            rec["score"] = float(s)
+            rec["score_vector"] = float(v)
+            rec["score_fts"] = float(f)
+            matches.append(rec)
+        return matches
+
+    def answer(self, db: Session, query: str, top_k: int = 5, hybrid: bool = False, alpha: float = HYBRID_DEFAULT_ALPHA) -> Dict:
+        matches = (
+            self.similarity_search_hybrid(db, query, top_k, alpha)
+            if hybrid
+            else self.similarity_search(db, query, top_k)
+        )
         if not matches:
             return {"answer": "関連するテキストが見つかりませんでした。", "matches": []}
 
@@ -131,6 +424,37 @@ class RAGService:
         answer = self._generate_answer(prompt)
 
         return {"answer": answer, "matches": matches}
+
+    def _similarity_search_libsql(
+        self, db: Session, query_vector: List[float], top_k: int
+    ) -> List[Dict]:
+        vector_literal = json.dumps(query_vector)
+        stmt = text(
+            """
+            SELECT
+                chunk.id AS chunk_id,
+                chunk.chunk_text AS chunk_text,
+                chunk.chunk_index AS chunk_index,
+                trans."音声ID" AS transcription_id,
+                trans."音声ファイルpath" AS file_path,
+                trans."タグ" AS tag,
+                trans."録音時刻" AS recorded_at,
+                trans."録音時間" AS duration,
+                matches.distance AS distance
+            FROM vector_top_k(:index_name, vector32(:query_vector), :top_k) AS matches
+            JOIN audio_transcription_chunks AS chunk ON chunk.id = matches.id
+            JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+            ORDER BY matches.distance ASC
+            """
+        )
+
+        params = {
+            "index_name": LIBSQL_VECTOR_INDEX_NAME,
+            "query_vector": vector_literal,
+            "top_k": top_k,
+        }
+        rows = db.execute(stmt, params).mappings().all()
+        return rows
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not self._client:
