@@ -50,7 +50,12 @@ def display_env_status(sidebar=True):
             "GOOGLE_CLOUD_PROJECT": "Google Cloud",
             "AWS_ACCESS_KEY_ID": "AWS",
             "AZURE_SPEECH_KEY": "Azure",
-            "ELEVENLABS_API_KEY": "ElevenLabs"
+            "ELEVENLABS_API_KEY": "ElevenLabs",
+            # Cloudflare R2
+            "R2_ACCOUNT_ID": "Cloudflare R2",
+            "R2_ACCESS_KEY_ID": "Cloudflare R2",
+            "R2_SECRET_ACCESS_KEY": "Cloudflare R2",
+            "R2_BUCKET_NAME": "Cloudflare R2",
         }
         
         for key, name in env_vars.items():

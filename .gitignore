@@ -18,6 +18,8 @@ wheels/
 
 # Database
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 audio_transcriptions.db
