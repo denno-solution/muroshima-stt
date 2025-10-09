@@ -189,3 +189,5 @@ Render（Docker）、Railway（PostgreSQL併用）、Heroku（Procfile追加）�
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
 - Streamlit UIに「💬 QA検索」タブがあり、検索件数スライダーとチャット履歴表示、参照チャンクのスコア/メタ情報の閲覧が可能。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
+
+ 

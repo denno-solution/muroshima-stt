@@ -18,6 +18,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import make_url
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.types import UserDefinedType
@@ -51,6 +52,33 @@ def _is_postgres(url: str) -> bool:
         return backend in {"postgresql", "postgres"}
     except Exception:
         return False
+
+
+def _extract_libsql_auth_token(url: str) -> str | None:
+    """DATABASE_URL から authToken を抽出（sqlalchemy-libsql 0.2系向け）。"""
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query or "")
+        token = qs.get("authToken") or qs.get("authtoken") or qs.get("auth_token")
+        if token and len(token) > 0:
+            return token[0]
+    except Exception:
+        pass
+    return None
+
+
+def _strip_auth_token_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query or "")
+        # auth に関係するキーを除去
+        for k in ["authToken", "authtoken", "auth_token"]:
+            if k in qs:
+                qs.pop(k, None)
+        new_q = urlencode(qs, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_q, parsed.fragment))
+    except Exception:
+        return url
 
 class AudioTranscription(Base):
     __tablename__ = 'audio_transcriptions'
@@ -178,7 +206,19 @@ engine_kwargs = dict(echo=False)
 if IS_LIBSQL:
     engine_kwargs["pool_pre_ping"] = True
 
-engine = create_engine(DATABASE_URL, **engine_kwargs)
+if IS_LIBSQL:
+    connect_args = {}
+    token = _extract_libsql_auth_token(DATABASE_URL) or os.getenv("TURSO_AUTH_TOKEN") or os.getenv("LIBSQL_AUTH_TOKEN")
+    if token:
+        # sqlalchemy-libsql >=0.2.0 は connect_args の "auth_token" を推奨
+        connect_args["auth_token"] = token
+    url_for_engine = _strip_auth_token_from_url(DATABASE_URL)
+    if connect_args:
+        engine = create_engine(url_for_engine, connect_args=connect_args, **engine_kwargs)
+    else:
+        engine = create_engine(url_for_engine, **engine_kwargs)
+else:
+    engine = create_engine(DATABASE_URL, **engine_kwargs)
 
 if IS_POSTGRES and Vector is not None:
     try:
