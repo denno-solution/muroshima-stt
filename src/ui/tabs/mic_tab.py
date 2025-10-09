@@ -70,7 +70,7 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                 duration = 0.0
                 logger.warning(f"音声変換失敗（WebMで処理継続）: {e}")
 
-        # クラウドストレージ連携は削除（Supabase依存を排除）
+        # クラウドストレージ連携は削除（外部依存を排除）
         storage_path = None
 
         # STT 実行
