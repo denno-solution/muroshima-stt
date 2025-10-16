@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "600"))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-4o-mini")
+# 2025-10 時点：gpt-5 系列を既定に（Responses API 対応、品質/コスパ良好）。
+COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-5-mini")
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in {"1", "true", "yes", "on"}
 
 # Hybrid search parameters
@@ -580,8 +581,9 @@ class RAGService:
         return chunks
 
     def _build_prompt(self, query: str, matches: List[Dict]) -> str:
-        context_lines = []
-        for match in matches:
+        """回答用のプロンプトを生成。コンテキストに通し番号を付与し、引用しやすくする。"""
+        numbered_context = []
+        for i, match in enumerate(matches, start=1):
             meta_parts = []
             if match.get("file_path"):
                 meta_parts.append(f"ファイル: {match['file_path']}")
@@ -590,46 +592,90 @@ class RAGService:
             if match.get("recorded_at"):
                 meta_parts.append(f"録音時刻: {match['recorded_at']}")
             meta = " / ".join(meta_parts)
-            header = f"[スコア: {match['score']:.3f}] {meta}" if meta else f"[スコア: {match['score']:.3f}]"
-            context_lines.append(f"{header}\n{match['chunk_text']}")
+            header = (
+                f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
+            )
+            numbered_context.append(f"{header}\n{match['chunk_text']}")
 
-        context_block = "\n\n".join(context_lines)
+        context_block = "\n\n".join(numbered_context)
 
+        # 出力スタイルはここで明示する（拒否よりも「分かっていること/不足していること」を優先）。
         instructions = (
-            "あなたは社内の音声文字起こしデータから質問に答えるアシスタントです。"
-            "以下のコンテキストのみを根拠に、根拠が無ければその旨を明示して日本語で簡潔に回答してください。"
+            "あなたは社内の音声文字起こしデータを根拠に回答する日本語アシスタントです。"  # 役割
+            "事実は必ず下のコンテキスト内から根拠を取り、出典として [#番号] を示してください。"  # 根拠と引用
+            "根拠が完全には揃わない場合でも、\"分かっていること\"と\"不足情報\"を分けて簡潔に答えてください。"  # 過度な拒否の抑制
+            "日付や時刻は可能なら YYYY-MM-DD 形式で明示してください。"  # 日付の明確化
         )
-        return f"{instructions}\n\nコンテキスト:\n{context_block}\n\n質問:\n{query}"
+
+        # 回答のフォーマットを固定化して安定させる
+        output_format = (
+            "出力は次の3セクションで返してください:\n"
+            "1) 回答:\n- 箇条書きで要点のみ（最大5項目）。\n"
+            "2) 根拠:\n- 参照した [#番号] と短い引用/要約（1〜3件）。\n"
+            "3) 不足情報/前提:\n- 追加で必要な情報や不確実な点。"
+        )
+
+        return (
+            f"{instructions}\n\n"
+            f"コンテキスト（番号付き）:\n{context_block}\n\n"
+            f"質問:\n{query}\n\n"
+            f"{output_format}"
+        )
 
     def _generate_answer(self, prompt: str) -> str:
         if not self._client:
             return ""
 
         try:
-            response = self._client.chat.completions.create(
+            # Responses API を使用（messages ではなく input）。温度は未指定＝既定値。
+            response = self._client.responses.create(
                 model=COMPLETION_MODEL,
-                messages=[
+                input=[
                     {
                         "role": "system",
-                        "content": "あなたは音声文字起こしデータを根拠に回答する日本語アシスタントです。根拠が無い時はその旨を伝えてください。",
+                        "content": (
+                            "あなたはRAGベースの社内QAアシスタントです。"
+                            "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
+                            "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
+                            "文体は簡潔で日本語、箇条書きを優先します。"
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.2,
             )
         except Exception as exc:  # pragma: no cover - APIエラー
             msg = str(exc)
-            logger.error("OpenAI chat_completions API 呼び出しで失敗: %s", msg)
+            logger.error("OpenAI Responses API 呼び出しで失敗: %s", msg)
             if "maximum context length" in msg or "context_length_exceeded" in msg or "too many tokens" in msg:
                 return (
                     "回答生成時にプロンプトが長過ぎました。検索上限または 'RAG_CONTEXT_MAX_*' を下げて再実行してください。"
                 )
             return "回答生成中にエラーが発生しました。ログを確認してください。"
 
-        choice = response.choices[0] if response.choices else None
-        if not choice or not choice.message or not choice.message.content:
-            return "回答を生成できませんでした。"
-        return choice.message.content.strip()
+        # SDK の output_text ヘルパーを優先使用（無い場合はフォールバック）
+        try:
+            text_out = getattr(response, "output_text", None)
+            if isinstance(text_out, str) and text_out.strip():
+                return text_out.strip()
+        except Exception:
+            pass
+
+        # フォールバック：output.items からテキストを連結（Responses API仕様の将来変化に備える）
+        out = []
+        try:
+            for item in getattr(response, "output", []) or []:
+                # item には {type: "message", content: [{type:"text", text:"..."}, ...]} 等が入る想定
+                contents = getattr(item, "content", None) or item.get("content") if isinstance(item, dict) else None
+                if isinstance(contents, list):
+                    for c in contents:
+                        t = getattr(c, "text", None) or (c.get("text") if isinstance(c, dict) else None)
+                        if isinstance(t, str):
+                            out.append(t)
+        except Exception:
+            pass
+
+        text_joined = "\n".join(out).strip()
+        return text_joined or "回答を生成できませんでした。"
 
 
 rag_service = RAGService()

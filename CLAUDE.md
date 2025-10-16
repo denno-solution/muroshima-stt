@@ -190,4 +190,8 @@ Render（Docker）、Railway（PostgreSQL併用）、Heroku（Procfile追加）�
 - Streamlit UIに「💬 QA検索」タブがあり、検索件数スライダーとチャット履歴表示、参照チャンクのスコア/メタ情報の閲覧が可能。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
- 
+## Agent Notes（RAG開発向けメモ）
+- 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5-mini`。Responses APIを使用。
+- `EMBEDDING_DIM` を変更する場合はDB列定義が固定のため、再作成（既存チャンク削除→再インデックス）が必要。
+- プロンプトは番号付きコンテキスト＋出典必須（[#番号]）で構成。回答/根拠/不足情報の3セクション出力を期待。
+- 温度は既定値（未指定）。再現性が要る場合は `.env` で上書きではなくプロンプト・候補件数を調整する。
