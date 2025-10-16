@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Boolean,
     create_engine,
     text,
 )
@@ -200,6 +201,18 @@ class AudioTranscriptionChunk(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     transcription = relationship("AudioTranscription", back_populates="chunks")
+
+
+class RAGChatLog(Base):
+    __tablename__ = 'rag_chat_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    user_text = Column(Text, nullable=False)
+    answer_text = Column(Text, nullable=True)
+    contexts = Column(JSON, nullable=True)  # 参照したチャンクやスコアを保持
+    used_hybrid = Column(Boolean, default=True, nullable=False)
+    alpha = Column(Float, nullable=True)
 
 # データベース接続設定
 engine_kwargs = dict(echo=False)

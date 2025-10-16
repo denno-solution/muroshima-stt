@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 
-from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db
+from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db, RAGChatLog
 from services.rag_service import get_rag_service
 
 
@@ -136,3 +136,22 @@ def run_rag_tab():
         st.caption(
             f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
         )
+
+    # チャットの入出力と参照コンテキストをDBに保存
+    with st.spinner("チャットを保存中..."):
+        db2 = next(get_db())
+        try:
+            log = RAGChatLog(
+                user_text=query,
+                answer_text=answer,
+                contexts=matches,
+                used_hybrid=bool(use_hybrid),
+                alpha=float(alpha) if alpha is not None else None,
+            )
+            db2.add(log)
+            db2.commit()
+        except Exception:
+            db2.rollback()
+            st.warning("チャットの保存に失敗しました。ログをご確認ください。")
+        finally:
+            db2.close()
