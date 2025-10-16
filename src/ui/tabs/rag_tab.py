@@ -1,5 +1,7 @@
 import os
+import json
 import streamlit as st
+from datetime import datetime, date
 
 from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db, RAGChatLog
 from services.rag_service import get_rag_service
@@ -82,76 +84,141 @@ def run_rag_tab():
 
     query = st.chat_input("文字起こしデータへの質問を入力してください")
 
-    if not query:
-        return
+    if query:
+        st.session_state.rag_history.append({"role": "user", "content": query})
+        st.chat_message("user").markdown(query)
 
-    st.session_state.rag_history.append({"role": "user", "content": query})
-    st.chat_message("user").markdown(query)
-
-    with st.spinner("関連チャンクを検索中..."):
-        db = next(get_db())
-        try:
-            result = rag_service.answer(
-                db, query, top_k=None, hybrid=use_hybrid, alpha=alpha, context_k=context_k
-            )
-        finally:
-            db.close()
-
-    answer = result.get("answer", "")
-    matches = result.get("matches", [])
-
-    assistant_payload = {
-        "role": "assistant",
-        "content": answer,
-        "contexts": matches,
-    }
-    st.session_state.rag_history.append(assistant_payload)
-
-    assistant_block = st.chat_message("assistant")
-    assistant_block.markdown(answer)
-
-    if matches:
-        with assistant_block.expander("参照したチャンク", expanded=False):
-            for idx, ctx in enumerate(matches, start=1):
-                st.markdown(
-                    f"**{idx}. 総合スコア:** {ctx['score']:.3f}"
-                    f" / **ファイル:** {ctx.get('file_path') or '-'}"
-                    f" / **タグ:** {ctx.get('tag') or '-'}"
+        with st.spinner("関連チャンクを検索中..."):
+            db = next(get_db())
+            try:
+                result = rag_service.answer(
+                    db, query, top_k=None, hybrid=use_hybrid, alpha=alpha, context_k=context_k
                 )
-                if ctx.get("recorded_at"):
-                    st.caption(f"録音時刻: {ctx['recorded_at']}")
-                # サブスコア（あれば表示）
-                sv = ctx.get("score_vector")
-                sf = ctx.get("score_fts")
-                if sv is not None or sf is not None:
-                    st.caption(
-                        f"ベクトル: {sv if sv is not None else '-'} / FTS: {sf if sf is not None else '-'}"
+            finally:
+                db.close()
+
+        answer = result.get("answer", "")
+        matches = result.get("matches", [])
+
+        assistant_payload = {
+            "role": "assistant",
+            "content": answer,
+            "contexts": matches,
+        }
+        st.session_state.rag_history.append(assistant_payload)
+
+        assistant_block = st.chat_message("assistant")
+        assistant_block.markdown(answer)
+
+        if matches:
+            with assistant_block.expander("参照したチャンク", expanded=False):
+                for idx, ctx in enumerate(matches, start=1):
+                    st.markdown(
+                        f"**{idx}. 総合スコア:** {ctx['score']:.3f}"
+                        f" / **ファイル:** {ctx.get('file_path') or '-'}"
+                        f" / **タグ:** {ctx.get('tag') or '-'}"
                     )
-                st.write(ctx["chunk_text"])
-                st.divider()
+                    if ctx.get("recorded_at"):
+                        st.caption(f"録音時刻: {ctx['recorded_at']}")
+                    # サブスコア（あれば表示）
+                    sv = ctx.get("score_vector")
+                    sf = ctx.get("score_fts")
+                    if sv is not None or sf is not None:
+                        st.caption(
+                            f"ベクトル: {sv if sv is not None else '-'} / FTS: {sf if sf is not None else '-'}"
+                        )
+                    st.write(ctx["chunk_text"])
+                    st.divider()
 
-    # 実際の使用件数などのメタ情報を簡単に表示
-    meta = result.get("meta") if isinstance(result, dict) else None
-    if meta:
-        st.caption(
-            f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
-        )
-
-    # チャットの入出力と参照コンテキストをDBに保存
-    with st.spinner("チャットを保存中..."):
-        db2 = next(get_db())
-        try:
-            log = RAGChatLog(
-                user_text=query,
-                answer_text=answer,
-                contexts=matches,
-                used_hybrid=bool(use_hybrid),
-                alpha=float(alpha) if alpha is not None else None,
+        # 実際の使用件数などのメタ情報を簡単に表示
+        meta = result.get("meta") if isinstance(result, dict) else None
+        if meta:
+            st.caption(
+                f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
             )
-            db2.add(log)
-            db2.commit()
-        except Exception:
-            db2.rollback()
-            st.warning("チャットの保存に失敗しました。ログをご確認ください。")
-        finally:
-            db2.close()
+
+        # チャットの入出力と参照コンテキストをDBに保存（JSONに安全に変換）
+        def _json_default(o):
+            if isinstance(o, (datetime, date)):
+                return o.isoformat()
+            return str(o)
+
+        contexts_json = json.loads(json.dumps(matches, default=_json_default))
+
+        with st.spinner("チャットを保存中..."):
+            db2 = next(get_db())
+            try:
+                log = RAGChatLog(
+                    user_text=query,
+                    answer_text=answer,
+                    contexts=contexts_json,
+                    used_hybrid=bool(use_hybrid),
+                    alpha=float(alpha) if alpha is not None else None,
+                )
+                db2.add(log)
+                db2.commit()
+            except Exception:
+                db2.rollback()
+                st.warning("チャットの保存に失敗しました。ログをご確認ください。")
+            finally:
+                db2.close()
+
+    # --- 過去のチャット履歴（直近） ---
+    st.divider()
+    st.subheader("過去のチャット履歴")
+
+    colh1, colh2, colh3 = st.columns([2, 1, 1])
+    with colh1:
+        kw = st.text_input("キーワード（質問/回答を対象）", value="", placeholder="例: 契約 期限" )
+    with colh2:
+        limit = st.slider("表示件数", min_value=5, max_value=100, value=20, step=5)
+    with colh3:
+        hybrid_filter = st.selectbox("ハイブリッド",
+                                     options=["すべて", "ON", "OFF"], index=0)
+
+    dbh = next(get_db())
+    try:
+        q = dbh.query(RAGChatLog).order_by(RAGChatLog.created_at.desc())
+        if kw:
+            from sqlalchemy import or_
+            q = q.filter(
+                or_(
+                    RAGChatLog.user_text.contains(kw),
+                    RAGChatLog.answer_text.contains(kw),
+                )
+            )
+        if hybrid_filter == "ON":
+            q = q.filter(RAGChatLog.used_hybrid.is_(True))
+        elif hybrid_filter == "OFF":
+            q = q.filter(RAGChatLog.used_hybrid.is_(False))
+
+        logs = q.limit(limit).all()
+    finally:
+        dbh.close()
+
+    if not logs:
+        st.info("保存されたチャット履歴がありません。検索/質問後にここへ表示されます。")
+    else:
+        for log in logs:
+            with st.expander(
+                f"[{log.created_at}] 質問: { (log.user_text or '')[:40] + ('…' if log.user_text and len(log.user_text) > 40 else '') }",
+                expanded=False,
+            ):
+                st.markdown("**質問**")
+                st.write(log.user_text or "")
+                st.markdown("**回答**")
+                st.write(log.answer_text or "")
+                st.caption(
+                    f"ハイブリッド: {'ON' if log.used_hybrid else 'OFF'} / α: {log.alpha if log.alpha is not None else '-'}"
+                )
+                ctxs = log.contexts or []
+                if ctxs:
+                    st.markdown("**参照したチャンク（最大3件を表示）**")
+                    for idx, ctx in enumerate(ctxs[:3], start=1):
+                        st.markdown(
+                            f"- {idx}. スコア: {ctx.get('score', '-')}; ファイル: {ctx.get('file_path','-')}; タグ: {ctx.get('tag','-')}"
+                        )
+                        if ctx.get("recorded_at"):
+                            st.caption(f"録音時刻: {ctx['recorded_at']}")
+                        snippet = (ctx.get("chunk_text") or "")
+                        st.text(snippet[:200] + ("…" if len(snippet) > 200 else ""))
