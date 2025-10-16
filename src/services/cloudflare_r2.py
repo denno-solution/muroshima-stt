@@ -6,6 +6,7 @@ from typing import Optional
 
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 
 @dataclass
@@ -163,3 +164,25 @@ def generate_presigned_get_url(
         return url
     except Exception:
         return None
+
+
+def object_exists_in_r2(key: str, cfg: Optional[R2Config] = None) -> bool:
+    """Return True if the object exists in the configured R2 bucket."""
+    if cfg is None:
+        cfg = load_r2_config_from_env()
+    if cfg is None:
+        return False
+    try:
+        s3 = _build_s3_client(cfg)
+        s3.head_object(Bucket=cfg.bucket_name, Key=key)
+        return True
+    except ClientError as e:  # type: ignore
+        try:
+            code = e.response.get("Error", {}).get("Code")
+        except Exception:
+            code = None
+        if code in ("404", "NoSuchKey"):
+            return False
+        return False
+    except Exception:
+        return False

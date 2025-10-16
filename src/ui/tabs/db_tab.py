@@ -8,6 +8,7 @@ from services.cloudflare_r2 import (
     build_object_key_for_filename,
     build_public_url_for_key,
     generate_presigned_get_url,
+    object_exists_in_r2,
 )
 
 
@@ -31,7 +32,7 @@ def run_db_tab():
             download_url = None
             if r2_cfg is not None:
                 key = build_object_key_for_filename(record.音声ファイルpath, r2_cfg)
-                if key:
+                if key and object_exists_in_r2(key, r2_cfg):
                     # 優先: 公開URL（R2_PUBLIC_BASE_URL が設定されている場合）
                     download_url = build_public_url_for_key(key, r2_cfg) or generate_presigned_get_url(
                         key, expires_in=signed_exp, cfg=r2_cfg
@@ -88,7 +89,7 @@ def run_db_tab():
                         # 右側にダウンロードリンクも提示
                         if r2_cfg is not None:
                             key = build_object_key_for_filename(record.音声ファイルpath, r2_cfg)
-                            if key:
+                            if key and object_exists_in_r2(key, r2_cfg):
                                 url = build_public_url_for_key(key, r2_cfg) or generate_presigned_get_url(
                                     key, expires_in=signed_exp, cfg=r2_cfg
                                 )
