@@ -104,3 +104,62 @@ def upload_file_to_r2(local_path: str, key: str, cfg: Optional[R2Config] = None)
 
     return {"bucket": cfg.bucket_name, "key": key, "url": url}
 
+
+def build_object_key_for_filename(filename: str, cfg: Optional[R2Config] = None) -> Optional[str]:
+    """Return the R2 object key for a given local filename considering prefix.
+
+    - If R2 is not configured, returns None.
+    - If `R2_PREFIX` is set, prepend it (ensuring a single slash).
+    - If filename already starts with the prefix, use as-is.
+    """
+    if cfg is None:
+        cfg = load_r2_config_from_env()
+    if cfg is None:
+        return None
+
+    key = filename.lstrip("/")
+    if cfg.prefix:
+        if not key.startswith(cfg.prefix):
+            key = f"{cfg.prefix}{key}"
+    return key
+
+
+def build_public_url_for_key(key: str, cfg: Optional[R2Config] = None) -> Optional[str]:
+    """Build a public URL using `R2_PUBLIC_BASE_URL` if available.
+
+    Example base: https://pub-xxxxxx.r2.dev/my-bucket
+    Result:       {base}/{key}
+    """
+    if cfg is None:
+        cfg = load_r2_config_from_env()
+    if cfg is None or not cfg.public_base_url:
+        return None
+    base = cfg.public_base_url.rstrip("/")
+    key = key.lstrip("/")
+    return f"{base}/{key}"
+
+
+def generate_presigned_get_url(
+    key: str,
+    expires_in: int = 900,
+    cfg: Optional[R2Config] = None,
+) -> Optional[str]:
+    """Generate a time-limited signed URL for GET on a private R2 object.
+
+    Returns None if R2 is not configured or on failure.
+    """
+    if cfg is None:
+        cfg = load_r2_config_from_env()
+    if cfg is None:
+        return None
+
+    try:
+        s3 = _build_s3_client(cfg)
+        url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": cfg.bucket_name, "Key": key},
+            ExpiresIn=expires_in,
+        )
+        return url
+    except Exception:
+        return None
