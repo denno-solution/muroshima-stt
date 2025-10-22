@@ -152,9 +152,23 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                         logger.error("R2設定が不足しています。R2_* 環境変数を確認してください。")
                     else:
                         try:
-                            # 保存済みのローカルパスがある場合はそれを使い、なければ一時ファイルを送る
-                            source_path = final_path or tmp_path
-                            key = final_filename
+                            # VAD ONならトリム後を優先してアップロード
+                            source_is_vad = False
+                            try:
+                                # use_vad / stt_input_path は上位スコープで定義済み
+                                if 'use_vad' in locals() and use_vad and 'stt_input_path' in locals() and os.path.exists(stt_input_path):
+                                    source_path = stt_input_path
+                                    source_is_vad = True
+                                else:
+                                    source_path = final_path or tmp_path
+                            except Exception:
+                                source_path = final_path or tmp_path
+
+                            if source_is_vad:
+                                key = f"{Path(final_filename).stem}_vad.wav"
+                            else:
+                                key = final_filename
+
                             r2_info = upload_file_to_r2(source_path, key, cfg)
                             r2_upload_ok = True
                             logger.info(f"R2アップロード成功: s3://{r2_info['bucket']}/{r2_info['key']}")
