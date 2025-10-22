@@ -61,6 +61,30 @@ def build_sidebar(settings: AppSettings, log_dir: Path, logger):
 
     st.divider()
 
+    # 前処理（VAD）
+    st.subheader("🎚️ 前処理")
+    use_vad = st.checkbox(
+        "非音声区間のカット（VAD）",
+        value=settings.get_use_vad(),
+        help="webrtcvad（軽量）で人の声がない区間を削除してからSTTに送信し、コストを削減します。"
+    )
+    if use_vad != settings.get_use_vad():
+        settings.set_use_vad(use_vad)
+        logger.info(f"VAD設定を保存: {use_vad}")
+
+    vad_aggr = st.slider(
+        "VAD積極度 (0=緩い, 3=厳しい)",
+        min_value=0,
+        max_value=3,
+        value=settings.get_vad_aggressiveness(),
+        help="値が大きいほど非音声と判定しやすくなります。誤カットが増える場合は下げてください。",
+    )
+    if vad_aggr != settings.get_vad_aggressiveness():
+        settings.set_vad_aggressiveness(vad_aggr)
+        logger.info(f"VAD積極度を保存: {vad_aggr}")
+
+    st.divider()
+
     # デバッグ
     st.subheader("🐛 デバッグ設定")
     debug_mode = st.checkbox("デバッグモードを有効化", value=settings.get_debug_mode())
@@ -96,4 +120,3 @@ def build_sidebar(settings: AppSettings, log_dir: Path, logger):
             st.rerun()
 
     return selected_model, use_structuring, debug_mode
-

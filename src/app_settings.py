@@ -72,3 +72,28 @@ class AppSettings:
     def set_auto_reload_env(self, auto_reload: bool):
         """環境変数の自動リロード機能の有効/無効を保存"""
         self.set("auto_reload_env", auto_reload)
+
+    # --- VAD（非音声区間カット）設定 ---
+    def get_use_vad(self) -> bool:
+        # 互換: 旧キー `vad_enabled` を読み取り、未設定なら既定は False（OFF）
+        if "use_vad" in self.settings:
+            return bool(self.settings["use_vad"])
+        if "vad_enabled" in self.settings:
+            # マイグレーション: 新キーへコピー
+            try:
+                self.settings["use_vad"] = bool(self.settings["vad_enabled"])
+                self._save_settings()
+            except Exception:
+                pass
+            return bool(self.settings["vad_enabled"])
+        return False
+
+    def set_use_vad(self, use: bool):
+        self.set("use_vad", use)
+
+    def get_vad_aggressiveness(self) -> int:
+        # 0(緩い)〜3(厳しめ)
+        return int(self.get("vad_aggressiveness", 2))
+
+    def set_vad_aggressiveness(self, val: int):
+        self.set("vad_aggressiveness", int(max(0, min(3, val))))

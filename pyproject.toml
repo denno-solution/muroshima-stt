@@ -17,6 +17,8 @@ dependencies = [
     "pandas>=2.0.0",
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
+    # 軽量VAD（非音声区間カット）
+    "webrtcvad>=2.0.10",
     # Google Generative AI (Gemini)
     "google-genai>=0.2.4",
     # その他

@@ -107,7 +107,27 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
         rag_service = get_rag_service()
 
         with st.spinner("文字起こし中..."):
-            transcription = stt_wrapper.transcribe(tmp_path)
+            # VAD前処理（任意）
+            app_settings = st.session_state.get("settings")
+            use_vad = bool(getattr(app_settings, "get_use_vad", lambda: False)())
+            vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: 2)())
+            stt_input_path = tmp_path
+            if use_vad:
+                try:
+                    from services.vad import trim_non_speech
+
+                    vad_res = trim_non_speech(tmp_path, enabled=True, aggressiveness=vad_aggr)
+                    stt_input_path = vad_res.output_path
+                    reduced = 0.0
+                    if vad_res.orig_sec > 0:
+                        reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
+                    st.info(f"VAD有効: 元{vad_res.orig_sec:.2f}s → 送信{vad_res.out_sec:.2f}s (−{reduced:.1f}%) [{vad_res.method}]")
+                    logger.info(f"VAD適用: {tmp_path} -> {stt_input_path}")
+                except Exception as e:
+                    logger.warning(f"VAD前処理に失敗したためスキップ: {e}")
+                    st.warning("VAD前処理に失敗したため、元音声を使用します。")
+
+            transcription = stt_wrapper.transcribe(stt_input_path)
             error_msg = None
             if isinstance(transcription, tuple) and transcription[0] is None:
                 error_msg = transcription[1]
@@ -243,6 +263,13 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
             except Exception:
                 pass
             logger.debug(f"一時ファイル削除: {tmp_path}")
+        # VAD生成ファイルの削除（保存先とは別に生成された場合）
+        try:
+            if 'stt_input_path' in locals() and stt_input_path != tmp_path and os.path.exists(stt_input_path):
+                os.unlink(stt_input_path)
+                logger.debug(f"VAD一時ファイル削除: {stt_input_path}")
+        except Exception:
+            pass
 
         # 状態リセット
         st.session_state.mic_processing = False

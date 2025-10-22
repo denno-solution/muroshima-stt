@@ -10,6 +10,7 @@ from models import AudioTranscription, get_db
 from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from services.rag_service import get_rag_service
+from services.vad import trim_non_speech
 
 
 def run_upload_tab(selected_model: str, use_structuring: bool, logger):
@@ -62,8 +63,29 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                 duration = len(audio_data) / sr
                 logger.debug(f"音声ファイル情報: 時間={duration:.2f}秒, サンプリングレート={sr}Hz")
 
+                # VAD前処理（任意）
+                app_settings = st.session_state.get("settings")
+                use_vad = bool(getattr(app_settings, "get_use_vad", lambda: False)())
+                vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: 2)())
+                stt_input_path = tmp_path
+                vad_note = None
+                if use_vad:
+                    try:
+                        vad_res = trim_non_speech(tmp_path, enabled=True, aggressiveness=vad_aggr)
+                        stt_input_path = vad_res.output_path
+                        reduced = 0.0
+                        if vad_res.orig_sec > 0:
+                            reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
+                        vad_note = f"VAD有効: 元{vad_res.orig_sec:.2f}s → 送信{vad_res.out_sec:.2f}s (−{reduced:.1f}%) [{vad_res.method}]"
+                        st.info(vad_note)
+                        logger.info(vad_note)
+                    except Exception as e:
+                        logger.warning(f"VAD前処理に失敗したためスキップ: {e}")
+                        st.warning("VAD前処理に失敗したため、元音声を使用します。")
+                        stt_input_path = tmp_path
+
                 logger.info(f"文字起こし実行中: {uploaded_file.name} (モデル: {selected_model})")
-                transcription = stt_wrapper.transcribe(tmp_path)
+                transcription = stt_wrapper.transcribe(stt_input_path)
 
                 error_msg = None
                 if isinstance(transcription, tuple) and transcription[0] is None:
@@ -125,8 +147,19 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                     else:
                         st.error(f"❌ {uploaded_file.name} の文字起こしに失敗しました（結果が空）")
                         logger.error(f"文字起こし失敗: {uploaded_file.name}, 結果が空")
-                os.unlink(tmp_path)
-                logger.debug(f"一時ファイル削除: {tmp_path}")
+                # 一時ファイル削除
+                try:
+                    os.unlink(tmp_path)
+                    logger.debug(f"一時ファイル削除: {tmp_path}")
+                except Exception:
+                    pass
+                # VADで生成した一時ファイルも削除
+                if stt_input_path != tmp_path:
+                    try:
+                        os.unlink(stt_input_path)
+                        logger.debug(f"VAD一時ファイル削除: {stt_input_path}")
+                    except Exception:
+                        pass
             except Exception as e:
                 error_msg = f"処理エラー ({uploaded_file.name}): {str(e)}"
                 st.error(error_msg)

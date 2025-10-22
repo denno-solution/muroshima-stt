@@ -2,6 +2,9 @@
 
 Streamlitを使用した音声文字起こしWebアプリ。複数のSTTモデルに対応し、Gemini Flash 2.5-liteによる自動構造化機能を搭載。
 
+## 運用メモ
+- 現在は Streamlit Community Cloud にデプロイして運用中。
+
 ## 機能
 
 - 複数音声ファイルの同時アップロード/マイク録音
