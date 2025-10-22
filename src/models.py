@@ -1,4 +1,5 @@
 import logging
+import time
 import os
 from array import array
 from datetime import datetime
@@ -240,13 +241,20 @@ if IS_POSTGRES and Vector is not None:
     except Exception as exc:  # pragma: no cover - 権限不足時の警告
         logger.warning("vector拡張の有効化に失敗: %s", exc)
 
-# テーブル作成
+# テーブル作成（所要時間をログ出力）
+_t0 = time.time()
 Base.metadata.create_all(bind=engine)
+_t1 = time.time()
+try:
+    logger.debug("DB schema check/create completed in %.3fs", _t1 - _t0)
+except Exception:
+    pass
 
 # セッション作成
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 if IS_LIBSQL:
+    _t2 = time.time()
     try:
         with engine.begin() as connection:
             # ベクトル式インデックス（正しい構文: USING ではなく式）
@@ -308,14 +316,35 @@ if IS_LIBSQL:
                 )
             )
 
-            # 初期同期（必要な場合のみ。既存が空のときにリビルドしても安全）
-            connection.execute(
-                text(
-                    "INSERT INTO audio_transcription_chunks_fts(audio_transcription_chunks_fts) VALUES('rebuild')"
+            # 'rebuild' は高コストのため、必要時のみ実行する
+            # 条件: FTSテーブルが空 かつ 基表にデータがある場合のみ
+            try:
+                fts_count = connection.execute(
+                    text("SELECT COUNT(*) FROM audio_transcription_chunks_fts")
+                ).scalar()
+            except Exception:
+                fts_count = 0
+            try:
+                base_count = connection.execute(
+                    text("SELECT COUNT(*) FROM audio_transcription_chunks")
+                ).scalar()
+            except Exception:
+                base_count = 0
+
+            if (fts_count or 0) == 0 and (base_count or 0) > 0:
+                connection.execute(
+                    text(
+                        "INSERT INTO audio_transcription_chunks_fts(audio_transcription_chunks_fts) VALUES('rebuild')"
+                    )
                 )
-            )
     except Exception as exc:  # pragma: no cover - 初期化時の警告
         logger.warning("libSQLの初期化（ベクトル/FTS）に失敗: %s", exc)
+    finally:
+        _t3 = time.time()
+        try:
+            logger.debug("libSQL init (indexes/FTS) completed in %.3fs", _t3 - _t2)
+        except Exception:
+            pass
 
 def get_db():
     db = SessionLocal()

@@ -12,8 +12,12 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # 依存関係のインストール
-echo "依存関係を確認しています..."
-uv sync
+if [ "${SKIP_UV_SYNC:-0}" = "1" ]; then
+  echo "依存関係の同期をスキップします (SKIP_UV_SYNC=1)"
+else
+  echo "依存関係を確認しています..."
+  uv sync
+fi
 
 # Streamlitアプリを起動
 echo "アプリを起動しています..."
