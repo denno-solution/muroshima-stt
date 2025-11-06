@@ -75,7 +75,7 @@ class AppSettings:
 
     # --- VAD（非音声区間カット）設定 ---
     def get_use_vad(self) -> bool:
-        # 互換: 旧キー `vad_enabled` を読み取り、未設定なら既定は False（OFF）
+        # 互換: 旧キー `vad_enabled` を読み取り、未設定なら既定は True（ON）
         if "use_vad" in self.settings:
             return bool(self.settings["use_vad"])
         if "vad_enabled" in self.settings:
@@ -86,7 +86,7 @@ class AppSettings:
             except Exception:
                 pass
             return bool(self.settings["vad_enabled"])
-        return False
+        return True
 
     def set_use_vad(self, use: bool):
         self.set("use_vad", use)

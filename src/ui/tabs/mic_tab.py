@@ -109,7 +109,7 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
         with st.spinner("文字起こし中..."):
             # VAD前処理（任意）
             app_settings = st.session_state.get("settings")
-            use_vad = bool(getattr(app_settings, "get_use_vad", lambda: False)())
+            use_vad = bool(getattr(app_settings, "get_use_vad", lambda: True)())
             vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: 2)())
             stt_input_path = tmp_path
             if use_vad:
