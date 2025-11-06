@@ -1,4 +1,4 @@
-"""RAG向けの埋め込み生成と保存ロジック。PostgresとTurso双方に対応。"""
+"""RAG向けの埋め込み生成と保存ロジック。Turso(libSQL)専用。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,11 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, Iterable, List, Tuple
 
 from openai import OpenAI
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from models import (
@@ -44,7 +45,7 @@ RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "100"))
 
 
 class RAGService:
-    """埋め込み管理と検索ロジック。pgvector/libSQL双方で動作。"""
+    """埋め込み管理と検索ロジック。Turso(libSQL)専用で動作。"""
 
     def __init__(self) -> None:
         self._enabled = bool(USE_VECTOR) and ENABLE_RAG
@@ -98,32 +99,7 @@ class RAGService:
 
         query_vector = query_embedding[0]
 
-        if self._vector_backend == "postgres":
-            distance_expr = AudioTranscriptionChunk.embedding.cosine_distance(query_vector)
-
-            stmt = (
-                select(
-                    AudioTranscriptionChunk.id.label("chunk_id"),
-                    AudioTranscriptionChunk.chunk_text.label("chunk_text"),
-                    AudioTranscriptionChunk.chunk_index.label("chunk_index"),
-                    AudioTranscription.音声ID.label("transcription_id"),
-                    AudioTranscription.音声ファイルpath.label("file_path"),
-                    AudioTranscription.タグ.label("tag"),
-                    AudioTranscription.録音時刻.label("recorded_at"),
-                    AudioTranscription.録音時間.label("duration"),
-                    distance_expr.label("distance"),
-                )
-                .select_from(AudioTranscriptionChunk)
-                .join(
-                    AudioTranscription,
-                    AudioTranscription.音声ID == AudioTranscriptionChunk.transcription_id,
-                )
-                .order_by(distance_expr)
-                .limit(top_k)
-            )
-
-            rows = db.execute(stmt).mappings().all()
-        elif self._vector_backend == "libsql":
+        if self._vector_backend == "libsql":
             rows = self._similarity_search_libsql(db, query_vector, top_k)
         else:
             return []
@@ -173,9 +149,7 @@ class RAGService:
         # 候補母集団の件数
         cand_k = max(top_k * HYBRID_CAND_MULT, top_k)
 
-        if self._vector_backend == "postgres":
-            return self._hybrid_postgres(db, query, qvec, top_k, cand_k, alpha)
-        elif self._vector_backend == "libsql":
+        if self._vector_backend == "libsql":
             return self._hybrid_libsql(db, query, qvec, top_k, cand_k, alpha)
         else:
             return []
@@ -341,149 +315,9 @@ class RAGService:
             matches.append(rec)
         return matches
 
-    # --- Postgres 実装（簡易版） ---
-    def _hybrid_postgres(
-        self,
-        db: Session,
-        query: str,
-        query_vector: List[float],
-        top_k: int,
-        cand_k: int,
-        alpha: float,
-    ) -> List[Dict]:
-        # ベクトル候補
-        distance_expr = AudioTranscriptionChunk.embedding.cosine_distance(query_vector)
-        vec_stmt = (
-            select(
-                AudioTranscriptionChunk.id.label("id"),
-                distance_expr.label("distance"),
-            )
-            .select_from(AudioTranscriptionChunk)
-            .order_by(distance_expr)
-            .limit(cand_k)
-        )
-        vec_rows = db.execute(vec_stmt).mappings().all()
+    # Postgres実装は削除（Turso専用化）
 
-        # FTS候補（simple辞書、ts_rank_cdでスコア取得）
-        fts_stmt = text(
-            """
-            SELECT id, ts_rank_cd(to_tsvector('simple', chunk_text), plainto_tsquery('simple', :q)) AS rank
-            FROM audio_transcription_chunks
-            WHERE to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', :q)
-            ORDER BY rank DESC
-            LIMIT :k
-            """
-        )
-        fts_rows = db.execute(fts_stmt, {"q": query, "k": cand_k}).mappings().all()
-
-        # 正規化・結合
-        vec_map = {int(r["id"]): float(1.0 - float(r["distance"])) for r in vec_rows}
-        # ts_rank_cd は 0〜1 程度の値が返る想定
-        fts_map = {int(r["id"]): float(max(0.0, float(r["rank"]))) for r in fts_rows}
-
-        ids = set(vec_map) | set(fts_map)
-        scored: List[Tuple[int, float, float, float]] = []
-        for cid in ids:
-            v = max(0.0, min(1.0, vec_map.get(cid, 0.0)))
-            f = max(0.0, min(1.0, fts_map.get(cid, 0.0)))
-            s = alpha * v + (1.0 - alpha) * f
-            scored.append((cid, s, v, f))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_ids = [cid for cid, _, _, _ in scored[:top_k]]
-        if not top_ids:
-            return []
-
-        ids_sql = ",".join(str(int(i)) for i in top_ids)
-        rows = db.execute(
-            text(
-                f"""
-                SELECT
-                    chunk.id AS chunk_id,
-                    chunk.chunk_text AS chunk_text,
-                    chunk.chunk_index AS chunk_index,
-                    trans."音声ID" AS transcription_id,
-                    trans."音声ファイルpath" AS file_path,
-                    trans."タグ" AS tag,
-                    trans."録音時刻" AS recorded_at,
-                    trans."録音時間" AS duration
-                FROM audio_transcription_chunks AS chunk
-                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
-                WHERE chunk.id IN ({ids_sql})
-                """
-            )
-        ).mappings().all()
-
-        row_map = {int(r["chunk_id"]): r for r in rows}
-        matches: List[Dict] = []
-        for cid, s, v, f in scored[:top_k]:
-            base = row_map.get(int(cid))
-            if not base:
-                continue
-            rec = dict(base)
-            rec["score"] = float(s)
-            rec["score_vector"] = float(v)
-            rec["score_fts"] = float(f)
-            matches.append(rec)
-        return matches
-
-    def answer(
-        self,
-        db: Session,
-        query: str,
-        top_k: int | None = None,
-        hybrid: bool = False,
-        alpha: float = HYBRID_DEFAULT_ALPHA,
-        context_k: int | None = None,
-    ) -> Dict:
-        # 取得する候補件数（検索母集団からの上位件数）。UIには出さない。
-        tk = int(top_k or RETRIEVAL_K)
-        matches_all = (
-            self.similarity_search_hybrid(db, query, tk, alpha)
-            if hybrid
-            else self.similarity_search(db, query, tk)
-        )
-        if not matches_all:
-            return {"answer": "関連するテキストが見つかりませんでした。", "matches": []}
-
-        # プロンプト用に上限を適用（件数/文字数）
-        use_k = int(context_k or CONTEXT_MAX_CHUNKS)
-        selected: List[Dict] = []
-        used_chars = 0
-        for m in matches_all:
-            if len(selected) >= use_k:
-                break
-            txt = m.get("chunk_text") or ""
-            # ヘッダ分のメタ情報余白も少し見込む（+128）
-            add_len = len(txt) + 128
-            if used_chars + add_len > CONTEXT_MAX_CHARS:
-                break
-            selected.append(m)
-            used_chars += add_len
-
-        if not selected:
-            # どれも長すぎて入らない場合は最上位1件だけトリムして使用
-            head = matches_all[0]
-            trimmed = dict(head)
-            trimmed["chunk_text"] = (head.get("chunk_text") or "")[: max(200, CONTEXT_MAX_CHARS // 2)]
-            selected = [trimmed]
-
-        prompt = self._build_prompt(query, selected)
-        answer = self._generate_answer(prompt)
-
-        return {
-            "answer": answer,
-            "matches": selected,
-            "meta": {
-                "candidates": len(matches_all),
-                "used_context_chunks": len(selected),
-                "used_context_chars": used_chars,
-                "limits": {
-                    "max_chunks": use_k,
-                    "max_chars": CONTEXT_MAX_CHARS,
-                },
-            },
-        }
+    # 一括生成APIは廃止（streaming専用化）
 
     def _similarity_search_libsql(
         self, db: Session, query_vector: List[float], top_k: int
@@ -676,6 +510,131 @@ class RAGService:
 
         text_joined = "\n".join(out).strip()
         return text_joined or "回答を生成できませんでした。"
+
+    # --- Streaming API ---
+    def answer_stream(
+        self,
+        db: Session,
+        query: str,
+        top_k: int | None = None,
+        hybrid: bool = False,
+        alpha: float = HYBRID_DEFAULT_ALPHA,
+        context_k: int | None = None,
+    ) -> Dict:
+        """検索→プロンプト生成までを先に実行し、テキスト生成はストリーミングで返す。
+
+        戻り値に `stream_fn`（呼び出すとジェネレータを返す関数）を含める。
+        UI側で `st.write_stream(result['stream_fn']())` などで逐次表示できる。
+        """
+        if not self.enabled or not self._client:
+            return {"matches": [], "meta": {}, "stream_fn": lambda: iter(())}
+
+        t0 = time.time()
+        tk = int(top_k or RETRIEVAL_K)
+        matches_all = (
+            self.similarity_search_hybrid(db, query, tk, alpha)
+            if hybrid
+            else self.similarity_search(db, query, tk)
+        )
+        t1 = time.time()
+        if not matches_all:
+            # 空ジェネレータを返す
+            return {
+                "matches": [],
+                "meta": {
+                    "candidates": 0,
+                    "used_context_chunks": 0,
+                    "used_context_chars": 0,
+                    "timings_ms": {"retrieval": int((t1 - t0) * 1000.0), "prompt_build": 0},
+                },
+                "stream_fn": lambda: iter(("関連するテキストが見つかりませんでした。",)),
+            }
+
+        # プロンプト用に上限を適用
+        use_k = int(context_k or CONTEXT_MAX_CHUNKS)
+        selected: List[Dict] = []
+        used_chars = 0
+        for m in matches_all:
+            if len(selected) >= use_k:
+                break
+            txt = m.get("chunk_text") or ""
+            add_len = len(txt) + 128
+            if used_chars + add_len > CONTEXT_MAX_CHARS:
+                break
+            selected.append(m)
+            used_chars += add_len
+
+        if not selected:
+            head = matches_all[0]
+            trimmed = dict(head)
+            trimmed["chunk_text"] = (head.get("chunk_text") or "")[: max(200, CONTEXT_MAX_CHARS // 2)]
+            selected = [trimmed]
+
+        prompt = self._build_prompt(query, selected)
+        t2 = time.time()
+
+        retrieval_s = (t1 - t0)
+        prompt_build_s = (t2 - t1)
+
+        def _stream_gen():
+            try:
+                with self._client.responses.stream(
+                    model=COMPLETION_MODEL,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "あなたはRAGベースの社内QAアシスタントです。"
+                                "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
+                                "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
+                                "文体は簡潔で日本語、箇条書きを優先します。"
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                ) as stream:
+                    tgen0 = time.time()
+                    for event in stream:
+                        et = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
+                        if et == "response.output_text.delta":
+                            delta = getattr(event, "delta", None) or (event.get("delta") if isinstance(event, dict) else None)
+                            if isinstance(delta, str) and delta:
+                                yield delta
+                        elif et == "response.error":
+                            err = getattr(event, "error", None) or (event.get("error") if isinstance(event, dict) else None)
+                            logger.error("Responses stream error: %s", err)
+                    tgen1 = time.time()
+                    generate_s = max(0.0, tgen1 - tgen0)
+                    total_s = retrieval_s + prompt_build_s + generate_s
+                    try:
+                        logger.debug(
+                            "RAG timings (s): retrieval=%.3fs, prompt_build=%.3fs, generate=%.3fs, total=%.3fs (candidates=%d, used_chunks=%d)",
+                            retrieval_s,
+                            prompt_build_s,
+                            generate_s,
+                            total_s,
+                            len(matches_all),
+                            len(selected),
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.error("Responses stream failed: %s", exc)
+                yield "\n[生成エラー] 回答のストリーミング中にエラーが発生しました。ログを確認してください。"
+
+        meta = {
+            "candidates": len(matches_all),
+            "used_context_chunks": len(selected),
+            "used_context_chars": used_chars,
+            "limits": {"max_chunks": use_k, "max_chars": CONTEXT_MAX_CHARS},
+            # 生成時間はUI側で計測し合算
+            "timings_ms": {
+                "retrieval": int((t1 - t0) * 1000.0),
+                "prompt_build": int((t2 - t1) * 1000.0),
+            },
+        }
+
+        return {"matches": selected, "meta": meta, "stream_fn": _stream_gen}
 
 
 rag_service = RAGService()

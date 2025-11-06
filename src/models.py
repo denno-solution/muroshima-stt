@@ -25,10 +25,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.types import UserDefinedType
 
-try:
-    from pgvector.sqlalchemy import Vector  # type: ignore
-except Exception:  # pragma: no cover - pgvector未導入環境向け
-    Vector = None
+# Postgres(pgvector)対応は廃止。libSQL専用。
 
 # .envファイルを読み込む
 load_dotenv()
@@ -48,12 +45,7 @@ def _is_libsql(url: str) -> bool:
         return False
 
 
-def _is_postgres(url: str) -> bool:
-    try:
-        backend = make_url(url).get_backend_name()
-        return backend in {"postgresql", "postgres"}
-    except Exception:
-        return False
+# Postgres検出は不要になったため削除
 
 
 def _extract_libsql_auth_token(url: str) -> str | None:
@@ -104,7 +96,6 @@ class AudioTranscription(Base):
 
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./audio_transcriptions.db')
-IS_POSTGRES = _is_postgres(DATABASE_URL)
 IS_LIBSQL = _is_libsql(DATABASE_URL)
 
 
@@ -171,9 +162,7 @@ def _blob_to_vector(blob: bytes, dimension: int) -> list[float]:
     return list(arr)
 
 
-if bool(Vector) and IS_POSTGRES:
-    VECTOR_BACKEND = "postgres"
-elif IS_LIBSQL:
+if IS_LIBSQL:
     VECTOR_BACKEND = "libsql"
 else:
     VECTOR_BACKEND = None
@@ -193,11 +182,10 @@ class AudioTranscriptionChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     chunk_text = Column(Text, nullable=False)
-    if VECTOR_BACKEND == "postgres":
-        embedding = Column(Vector(EMBEDDING_DIM), nullable=False)
-    elif VECTOR_BACKEND == "libsql":
+    if VECTOR_BACKEND == "libsql":
         embedding = Column(LibSQLF32Vector(EMBEDDING_DIM), nullable=False)
     else:
+        # ローカルSQLite（非libSQL）の場合はRAG無効のためJSONで可
         embedding = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -234,12 +222,7 @@ if IS_LIBSQL:
 else:
     engine = create_engine(DATABASE_URL, **engine_kwargs)
 
-if IS_POSTGRES and Vector is not None:
-    try:
-        with engine.connect() as connection:
-            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    except Exception as exc:  # pragma: no cover - 権限不足時の警告
-        logger.warning("vector拡張の有効化に失敗: %s", exc)
+# Postgres向けの初期化は削除（Turso専用化）
 
 # テーブル作成（所要時間をログ出力）
 _t0 = time.time()

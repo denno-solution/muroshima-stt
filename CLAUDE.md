@@ -3,14 +3,14 @@
 Streamlitを使用した音声文字起こしWebアプリ。複数のSTTモデルに対応し、Gemini Flash 2.5-liteによる自動構造化機能を搭載。
 
 ## 運用メモ
-- 現在は Streamlit Community Cloud にデプロイして運用中。
+- 本番デプロイ先: Streamlit Community Cloud
 
 ## 機能
 
 - 複数音声ファイルの同時アップロード/マイク録音
 - 5つのSTTモデル対応（OpenAI、Google Cloud、Amazon、Azure、ElevenLabs）
 - Gemini Flash 2.5-liteによる文字起こしテキストの自動構造化
-- PostgreSQL/SQLiteデータベース保存
+- Turso(libSQL)/SQLiteデータベース保存（本番はTursoに完全移行）
 - Basic認証によるアクセス制限（オプション）
 
 ## クイックスタート
@@ -31,12 +31,12 @@ nano .env
 
 ### 2. データベース設定
 
-**Turso(libSQL) 使用（推奨）**:
+**Turso(libSQL) 使用（本番・推奨）**:
 1. TursoでDBを作成しURL/トークンを取得
 2. `.env` の `DATABASE_URL` を `sqlite+libsql://<db>-<org>.turso.io?secure=true&authToken=...` に設定
 3. 初回起動時に `audio_transcription_chunks` のベクトル式インデックス（libsql_vector_idx）が自動作成されます
 
-**ローカル開発**: SQLiteが自動使用されます
+**ローカル開発**: 通常のSQLiteが自動使用されます（RAGは無効）
 
 ### 3. 起動と使用
 
@@ -62,7 +62,7 @@ nano .env
 |------|---------|------|
 | **STTモデル** | 下記いずれか1つ | 選択したモデル用 |
 | **構造化** | GEMINI_API_KEY | Gemini Flash 2.5-lite用 |
-| **データベース** | DATABASE_URL | PostgreSQL使用時 |
+| **データベース** | DATABASE_URL | `sqlite+libsql://...`（Turso） |
 | **Basic認証** | BASIC_AUTH_USERNAME<br>BASIC_AUTH_PASSWORD | オプション |
 
 ### STTモデル別環境変数
@@ -100,11 +100,11 @@ BASIC_AUTH_PASSWORD=secure-password
 ### 設定の永続化
 - STTモデル選択、構造化機能、デバッグモードの設定は`.app_settings.json`に自動保存
 
-### Turso(libSQL)利用時のポイント
+### データベース利用時のポイント（Turso専用）
 - `DATABASE_URL` に `sqlite+libsql://<db名>-<org>.turso.io?secure=true&authToken=...` を設定するとリモートTursoに接続可能
-- `audio_transcription_chunks` の `libsql_vector_idx` 作成と `OPENAI_API_KEY` 設定でRAGタブが有効化
+- `audio_transcription_chunks` の `libsql_vector_idx` 作成（アプリが初回自動作成）と `OPENAI_API_KEY` 設定でRAGタブが有効化
 
-### データベーススキーマ
+### データベーススキーマ（Turso）
 
 | カラム名 | 型 | 説明 |
 |---------|-----|------|
@@ -169,31 +169,22 @@ uv remove package-name
 uv lock --upgrade
 ```
 
-## デプロイ
-
-### Streamlit Cloud
-1. GitHubリポジトリを接続
-2. Main file path: `src/app.py` を指定
-3. Secretsに `DATABASE_URL` / `OPENAI_API_KEY` など環境変数を設定
-
-詳細は`DEPLOY.md`参照。
-
-### その他のプラットフォーム
-Render（Docker）、Railway（PostgreSQL併用）、Heroku（Procfile追加）に対応。
 
 ## 重要な注意事項
 - **import-instruction-reminders**: 要求されたことのみ実行
 - **既存ファイル優先**: 新規作成より既存ファイル編集を優先
 - **ドキュメント作成制限**: 明示的に要求されない限り*.mdファイル作成禁止
 
-- RAG機能は Postgres(pgvector) および Turso(libSQL) の双方に対応。
-- `DATABASE_URL` がPostgresの場合は初回に `CREATE EXTENSION IF NOT EXISTS vector;` を実行します。
+- RAG機能は Turso(libSQL) 専用です（Postgres対応は削除）。
 - `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-small), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
 - Streamlit UIに「💬 QA検索」タブがあり、検索件数スライダーとチャット履歴表示、参照チャンクのスコア/メタ情報の閲覧が可能。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
 ## Agent Notes（RAG開発向けメモ）
+- 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
+- DB関連の実装・最適化はlibSQLのベクトル関数（`vector_top_k`, `vector_distance_cos`, `libsql_vector_idx`）とFTS5のみを前提にしてください。
+- QA検索タブの回答生成は「ストリーミングのみ」です。非ストリーミングAPIはコードから撤去済みです。
 - 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5-mini`。Responses APIを使用。
 - `EMBEDDING_DIM` を変更する場合はDB列定義が固定のため、再作成（既存チャンク削除→再インデックス）が必要。
 - プロンプトは番号付きコンテキスト＋出典必須（[#番号]）で構成。回答/根拠/不足情報の3セクション出力を期待。

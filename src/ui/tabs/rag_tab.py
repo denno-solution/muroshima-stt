@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import streamlit as st
 from datetime import datetime, date
 
@@ -15,20 +16,15 @@ def run_rag_tab():
     if not rag_service.enabled:
         if not USE_VECTOR:
             st.warning(
-                "RAG機能を利用するには Postgres + pgvector または Turso(libSQL) のベクトル対応データベースを構成し、"
-                "audio_transcription_chunks にベクトルインデックスを作成してください。"
+                "RAG機能を利用するには Turso(libSQL) のベクトル対応データベースを構成し、"
+                "audio_transcription_chunks に libsql_vector_idx を作成してください（自動作成済みでない場合）。"
             )
-            st.info(
-                "Postgresの場合はpgvector拡張を有効化、Turso(libSQL)の場合は libsql_vector_idx を作成した上で再度お試しください。"
-            )
+            st.info("ローカルの通常SQLiteではRAGは無効化されます。Tursoの `sqlite+libsql://` を使用してください。")
         else:
             st.warning(
                 "OPENAI_API_KEY が未設定、もしくは埋め込みモデル設定に問題があるためRAGが無効化されています。"
             )
-            if VECTOR_BACKEND == "libsql":
-                st.info("環境変数にOPENAI_API_KEYを設定し、必要に応じて EMBEDDING_MODEL / EMBEDDING_DIM を調整してください。")
-            else:
-                st.info("OPENAI_API_KEY を設定し、アプリを再起動してください。")
+            st.info("環境変数にOPENAI_API_KEYを設定し、必要に応じて EMBEDDING_MODEL / EMBEDDING_DIM を調整してください。")
         return
 
     if "rag_history" not in st.session_state:
@@ -36,7 +32,7 @@ def run_rag_tab():
 
     # 検索は常に全データ対象（ベクトル/FTSインデックスは全体から上位を返す）。
     # 候補取得件数（top_k）は内部既定値で固定し、UIでは非表示。
-    st.caption("検索は全データから上位候補を自動抽出します（設定不要）。")
+    st.caption("検索は全データから上位候補を自動抽出します（設定不要）。実行中にタブを切り替えると処理が中断されることがあります。")
 
     # ハイブリッド検索オプション
     default_alpha = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))
@@ -63,6 +59,7 @@ def run_rag_tab():
             step=0.05,
             help="1.0でベクトルのみ、0.0でFTSのみ。既定は0.6。",
         )
+    # ストリーミングは常に有効
     # 回答に使うチャンク上限は内部既定値（RAG_CONTEXT_MAX_CHUNKS）で固定。UIでは非表示。
     context_k = None
 
@@ -88,56 +85,73 @@ def run_rag_tab():
         st.session_state.rag_history.append({"role": "user", "content": query})
         st.chat_message("user").markdown(query)
 
-        with st.spinner("関連チャンクを検索中..."):
+        # ストリーミング実行のみ
+        with st.spinner("検索を実行中..."):
             db = next(get_db())
             try:
-                result = rag_service.answer(
+                result2 = rag_service.answer_stream(
                     db, query, top_k=None, hybrid=use_hybrid, alpha=alpha, context_k=context_k
                 )
             finally:
                 db.close()
 
-        answer = result.get("answer", "")
-        matches = result.get("matches", [])
+        matches = result2.get("matches", [])
+        meta = result2.get("meta") or {}
+        stream_fn = result2.get("stream_fn")
 
-        assistant_payload = {
-            "role": "assistant",
-            "content": answer,
-            "contexts": matches,
-        }
-        st.session_state.rag_history.append(assistant_payload)
+        # ストリーミング表示
+        with st.chat_message("assistant"):
+            tgen0 = time.time()
+            try:
+                full_text = st.write_stream(stream_fn()) if callable(stream_fn) else ""
+            except Exception:
+                acc = ""
+                placeholder = st.empty()
+                try:
+                    for chunk in (stream_fn() if callable(stream_fn) else []):
+                        acc += str(chunk)
+                        placeholder.markdown(acc)
+                except Exception:
+                    acc = "[エラー] 出力のストリーミングに失敗しました。"
+                    placeholder.markdown(acc)
+                full_text = acc
+            tgen1 = time.time()
 
-        assistant_block = st.chat_message("assistant")
-        assistant_block.markdown(answer)
-
-        if matches:
-            with assistant_block.expander("参照したチャンク", expanded=False):
-                for idx, ctx in enumerate(matches, start=1):
-                    st.markdown(
-                        f"**{idx}. 総合スコア:** {ctx['score']:.3f}"
-                        f" / **ファイル:** {ctx.get('file_path') or '-'}"
-                        f" / **タグ:** {ctx.get('tag') or '-'}"
-                    )
-                    if ctx.get("recorded_at"):
-                        st.caption(f"録音時刻: {ctx['recorded_at']}")
-                    # サブスコア（あれば表示）
-                    sv = ctx.get("score_vector")
-                    sf = ctx.get("score_fts")
-                    if sv is not None or sf is not None:
-                        st.caption(
-                            f"ベクトル: {sv if sv is not None else '-'} / FTS: {sf if sf is not None else '-'}"
+            # 参照チャンク表示
+            if matches:
+                with st.expander("参照したチャンク", expanded=False):
+                    for idx, ctx in enumerate(matches, start=1):
+                        st.markdown(
+                            f"**{idx}. 総合スコア:** {ctx['score']:.3f}"
+                            f" / **ファイル:** {ctx.get('file_path') or '-'}"
+                            f" / **タグ:** {ctx.get('tag') or '-'}"
                         )
-                    st.write(ctx["chunk_text"])
-                    st.divider()
+                        if ctx.get("recorded_at"):
+                            st.caption(f"録音時刻: {ctx['recorded_at']}")
+                        sv = ctx.get("score_vector")
+                        sf = ctx.get("score_fts")
+                        if sv is not None or sf is not None:
+                            st.caption(
+                                f"ベクトル: {sv if sv is not None else '-'} / FTS: {sf if sf is not None else '-'}"
+                            )
+                        st.write(ctx["chunk_text"])
+                        st.divider()
 
-        # 実際の使用件数などのメタ情報を簡単に表示
-        meta = result.get("meta") if isinstance(result, dict) else None
-        if meta:
-            st.caption(
-                f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
-            )
+        # メタ情報（秒単位）
+        timings = (meta.get("timings_ms") or {}) if isinstance(meta, dict) else {}
+        retrieval_s = (timings.get("retrieval") or 0) / 1000.0
+        prompt_s = (timings.get("prompt_build") or 0) / 1000.0
+        gen_s = (tgen1 - tgen0)
+        total_s = retrieval_s + prompt_s + gen_s
+        cap = f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
+        cap += f" / 検索: {retrieval_s:.3f}s / 生成: {gen_s:.3f}s / 合計: {total_s:.3f}s"
+        st.caption(cap)
 
-        # チャットの入出力と参照コンテキストをDBに保存（JSONに安全に変換）
+        # 履歴・DB保存
+        st.session_state.rag_history.append(
+            {"role": "assistant", "content": full_text, "contexts": matches}
+        )
+
         def _json_default(o):
             if isinstance(o, (datetime, date)):
                 return o.isoformat()
@@ -150,7 +164,7 @@ def run_rag_tab():
             try:
                 log = RAGChatLog(
                     user_text=query,
-                    answer_text=answer,
+                    answer_text=full_text,
                     contexts=contexts_json,
                     used_hybrid=bool(use_hybrid),
                     alpha=float(alpha) if alpha is not None else None,
