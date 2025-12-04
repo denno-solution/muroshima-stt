@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import datetime, date
 
 from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db, RAGChatLog
-from services.rag_service import get_rag_service
+from services.rag_service import get_rag_service, highlight_date_in_query
 
 
 def run_rag_tab():
@@ -65,7 +65,11 @@ def run_rag_tab():
 
     for message in st.session_state.rag_history:
         block = st.chat_message(message["role"])
-        block.markdown(message["content"])
+        # ユーザーのメッセージは日付をハイライト
+        if message["role"] == "user":
+            block.markdown(highlight_date_in_query(message["content"]))
+        else:
+            block.markdown(message["content"])
         if message["role"] == "assistant" and message.get("contexts"):
             with block.expander("参照したチャンク", expanded=False):
                 for idx, ctx in enumerate(message["contexts"], start=1):
@@ -79,18 +83,32 @@ def run_rag_tab():
                     st.write(ctx["chunk_text"])
                     st.divider()
 
-    query = st.chat_input("文字起こしデータへの質問を入力してください")
+    query = st.chat_input("文字起こしデータへの質問を入力してください（例: 「昨日の会議について」「12月3日の打ち合わせ内容」）")
 
     if query:
         st.session_state.rag_history.append({"role": "user", "content": query})
-        st.chat_message("user").markdown(query)
+        # 日付部分をハイライトして表示
+        st.chat_message("user").markdown(highlight_date_in_query(query))
+
+        # 会話履歴を構築（現在の質問は除外）
+        chat_history_for_rag = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in st.session_state.rag_history[:-1]  # 最後の質問は除外
+            if msg["role"] in ("user", "assistant") and msg.get("content")
+        ]
 
         # ストリーミング実行のみ
         with st.spinner("検索を実行中..."):
             db = next(get_db())
             try:
                 result2 = rag_service.answer_stream(
-                    db, query, top_k=None, hybrid=use_hybrid, alpha=alpha, context_k=context_k
+                    db,
+                    query,
+                    top_k=None,
+                    hybrid=use_hybrid,
+                    alpha=alpha,
+                    context_k=context_k,
+                    chat_history=chat_history_for_rag,
                 )
             finally:
                 db.close()
@@ -137,6 +155,14 @@ def run_rag_tab():
                         st.write(ctx["chunk_text"])
                         st.divider()
 
+        # 日付フィルタの警告表示
+        date_filter = meta.get("date_filter")
+        if meta.get("date_no_match") and date_filter:
+            st.warning(
+                f"⚠️ 指定された日付（{date_filter.get('start')}）に該当するデータがありませんでした。"
+                f"以下は日付フィルタなしの検索結果です。"
+            )
+
         # メタ情報（秒単位）
         timings = (meta.get("timings_ms") or {}) if isinstance(meta, dict) else {}
         retrieval_s = (timings.get("retrieval") or 0) / 1000.0
@@ -145,6 +171,15 @@ def run_rag_tab():
         total_s = retrieval_s + prompt_s + gen_s
         cap = f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
         cap += f" / 検索: {retrieval_s:.3f}s / 生成: {gen_s:.3f}s / 合計: {total_s:.3f}s"
+        # 日付フィルタ情報
+        if date_filter:
+            cap += f" / 📅 日付: {date_filter.get('start')}"
+            if date_filter.get('start') != date_filter.get('end'):
+                cap += f" 〜 {date_filter.get('end')}"
+            if meta.get("date_filtered"):
+                cap += " ✓"
+            elif meta.get("date_no_match"):
+                cap += " (該当なし)"
         st.caption(cap)
 
         # 履歴・DB保存

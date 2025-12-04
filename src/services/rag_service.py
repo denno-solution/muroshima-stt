@@ -7,7 +7,8 @@ import logging
 import os
 import re
 import time
-from typing import Dict, Iterable, List, Tuple
+from datetime import datetime, date, timedelta
+from typing import Dict, Iterable, List, Tuple, Optional
 
 from openai import OpenAI
 from sqlalchemy import text
@@ -42,6 +43,137 @@ CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONTEXT_MAX_CHARS", "20000"))  # おお�
 
 # Retrieval breadth（検索候補の母集団サイズ）。インデックスは常に全体を対象に上位を返します。
 RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "100"))
+
+
+def parse_date_from_query(query: str) -> Optional[Tuple[date, date]]:
+    """クエリから日付範囲を抽出する。
+
+    対応パターン:
+    - 「12月3日」「12/3」「12-3」 → 今年のその日付
+    - 「2024年12月3日」「2024/12/3」 → 指定年月日
+    - 「先月」「今月」「先週」「今週」「昨日」「今日」「一昨日」
+    - 「◯日前」「◯週間前」「◯ヶ月前」
+
+    Returns:
+        (start_date, end_date) のタプル、または None
+    """
+    today = date.today()
+    current_year = today.year
+
+    # 相対日付パターン
+    if "今日" in query:
+        return (today, today)
+    if "昨日" in query:
+        yesterday = today - timedelta(days=1)
+        return (yesterday, yesterday)
+    if "一昨日" in query or "おととい" in query:
+        day_before = today - timedelta(days=2)
+        return (day_before, day_before)
+    if "今週" in query:
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        return (start, min(end, today))
+    if "先週" in query:
+        start = today - timedelta(days=today.weekday() + 7)
+        end = start + timedelta(days=6)
+        return (start, end)
+    if "今月" in query:
+        start = today.replace(day=1)
+        return (start, today)
+    if "先月" in query:
+        first_of_month = today.replace(day=1)
+        last_month_end = first_of_month - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        return (last_month_start, last_month_end)
+
+    # 「◯日前」「◯週間前」「◯ヶ月前」パターン
+    days_ago = re.search(r"(\d+)\s*日前", query)
+    if days_ago:
+        n = int(days_ago.group(1))
+        target = today - timedelta(days=n)
+        return (target, target)
+
+    weeks_ago = re.search(r"(\d+)\s*週間?前", query)
+    if weeks_ago:
+        n = int(weeks_ago.group(1))
+        target_end = today - timedelta(weeks=n)
+        target_start = target_end - timedelta(days=6)
+        return (target_start, target_end)
+
+    months_ago = re.search(r"(\d+)\s*[ヶか]?月前", query)
+    if months_ago:
+        n = int(months_ago.group(1))
+        # 簡易的に30日単位で計算
+        target = today - timedelta(days=30 * n)
+        month_start = target.replace(day=1)
+        if target.month == 12:
+            month_end = target.replace(day=31)
+        else:
+            month_end = target.replace(month=target.month + 1, day=1) - timedelta(days=1)
+        return (month_start, month_end)
+
+    # 具体的な日付パターン: 「2024年12月3日」「2024/12/3」「2024-12-3」
+    full_date = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", query)
+    if full_date:
+        try:
+            year = int(full_date.group(1))
+            month = int(full_date.group(2))
+            day = int(full_date.group(3))
+            target = date(year, month, day)
+            return (target, target)
+        except ValueError:
+            pass
+
+    # 月日パターン: 「12月3日」「12/3」「12-3」
+    month_day = re.search(r"(\d{1,2})[月/\-](\d{1,2})日?", query)
+    if month_day:
+        try:
+            month = int(month_day.group(1))
+            day = int(month_day.group(2))
+            # 今年のその日付を試す。未来なら去年
+            target = date(current_year, month, day)
+            if target > today:
+                target = date(current_year - 1, month, day)
+            return (target, target)
+        except ValueError:
+            pass
+
+    return None
+
+
+def highlight_date_in_query(query: str) -> str:
+    """クエリ内の日付パターンをStreamlitのカラーマークダウンでハイライトする。"""
+    result = query
+
+    # ハイライト用のラッパー関数
+    def wrap(match: re.Match) -> str:
+        return f":orange[{match.group(0)}]"
+
+    # 相対日付キーワード
+    relative_patterns = [
+        r"今日",
+        r"昨日",
+        r"一昨日",
+        r"おととい",
+        r"今週",
+        r"先週",
+        r"今月",
+        r"先月",
+        r"\d+\s*日前",
+        r"\d+\s*週間?前",
+        r"\d+\s*[ヶか]?月前",
+    ]
+
+    for pattern in relative_patterns:
+        result = re.sub(pattern, wrap, result)
+
+    # 具体的な日付パターン（年月日）
+    result = re.sub(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", wrap, result)
+
+    # 月日パターン
+    result = re.sub(r"(\d{1,2})[月/\-](\d{1,2})日?", wrap, result)
+
+    return result
 
 
 class RAGService:
@@ -511,6 +643,99 @@ class RAGService:
         text_joined = "\n".join(out).strip()
         return text_joined or "回答を生成できませんでした。"
 
+    def _filter_by_date(self, matches: List[Dict], date_range: Tuple[date, date]) -> List[Dict]:
+        """検索結果を日付範囲でフィルタリング。"""
+        start_date, end_date = date_range
+        filtered = []
+        for m in matches:
+            recorded_at = m.get("recorded_at")
+            if not recorded_at:
+                continue
+            # datetime型またはstring型を処理
+            if isinstance(recorded_at, str):
+                try:
+                    recorded_date = datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).date()
+                except (ValueError, TypeError):
+                    try:
+                        # 別のフォーマットを試す
+                        recorded_date = datetime.strptime(recorded_at[:10], "%Y-%m-%d").date()
+                    except (ValueError, TypeError):
+                        continue
+            elif isinstance(recorded_at, datetime):
+                recorded_date = recorded_at.date()
+            elif isinstance(recorded_at, date):
+                recorded_date = recorded_at
+            else:
+                continue
+
+            if start_date <= recorded_date <= end_date:
+                filtered.append(m)
+        return filtered
+
+    def _build_chat_prompt(
+        self,
+        query: str,
+        matches: List[Dict],
+        chat_history: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """会話履歴を含むプロンプトを生成。OpenAI Responses API形式で返す。"""
+        # コンテキストブロックを生成
+        numbered_context = []
+        for i, match in enumerate(matches, start=1):
+            meta_parts = []
+            if match.get("file_path"):
+                meta_parts.append(f"ファイル: {match['file_path']}")
+            if match.get("tag"):
+                meta_parts.append(f"タグ: {match['tag']}")
+            if match.get("recorded_at"):
+                recorded = match["recorded_at"]
+                if isinstance(recorded, datetime):
+                    recorded = recorded.strftime("%Y-%m-%d %H:%M")
+                elif isinstance(recorded, date):
+                    recorded = recorded.strftime("%Y-%m-%d")
+                meta_parts.append(f"録音日時: {recorded}")
+            meta = " / ".join(meta_parts)
+            header = (
+                f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
+            )
+            numbered_context.append(f"{header}\n{match['chunk_text']}")
+
+        context_block = "\n\n".join(numbered_context)
+
+        system_content = (
+            "あなたはRAGベースの社内QAアシスタントです。"
+            "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
+            "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
+            "文体は簡潔で日本語、箇条書きを優先します。"
+            "会話の文脈を維持し、前の質問への回答と関連付けて答えてください。"
+        )
+
+        messages = [{"role": "system", "content": system_content}]
+
+        # 会話履歴を追加（最新5ターン程度に制限）
+        if chat_history:
+            # 履歴は (user, assistant) のペアで構成されている想定
+            recent_history = chat_history[-10:]  # 最新10メッセージ
+            for msg in recent_history:
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+
+        # 現在のクエリとコンテキストを追加
+        user_prompt = (
+            f"以下のコンテキスト（番号付き）を参照して質問に答えてください。\n\n"
+            f"コンテキスト:\n{context_block}\n\n"
+            f"質問:\n{query}\n\n"
+            f"出力は次の3セクションで返してください:\n"
+            f"1) 回答: 箇条書きで要点のみ（最大5項目）。\n"
+            f"2) 根拠: 参照した [#番号] と短い引用/要約（1〜3件）。\n"
+            f"3) 不足情報/前提: 追加で必要な情報や不確実な点。"
+        )
+        messages.append({"role": "user", "content": user_prompt})
+
+        return messages
+
     # --- Streaming API ---
     def answer_stream(
         self,
@@ -520,8 +745,12 @@ class RAGService:
         hybrid: bool = False,
         alpha: float = HYBRID_DEFAULT_ALPHA,
         context_k: int | None = None,
+        chat_history: Optional[List[Dict]] = None,
     ) -> Dict:
         """検索→プロンプト生成までを先に実行し、テキスト生成はストリーミングで返す。
+
+        Args:
+            chat_history: 過去の会話履歴 [{"role": "user"|"assistant", "content": "..."}, ...]
 
         戻り値に `stream_fn`（呼び出すとジェネレータを返す関数）を含める。
         UI側で `st.write_stream(result['stream_fn']())` などで逐次表示できる。
@@ -536,18 +765,44 @@ class RAGService:
             if hybrid
             else self.similarity_search(db, query, tk)
         )
+
+        # 日付フィルタを適用
+        date_range = parse_date_from_query(query)
+        date_filtered = False
+        date_detected = date_range is not None
+        date_no_match = False
+        if date_range and matches_all:
+            filtered = self._filter_by_date(matches_all, date_range)
+            if filtered:
+                # 日付でフィルタした結果を優先使用
+                matches_all = filtered
+                date_filtered = True
+            else:
+                # 日付は検出されたがマッチするデータがない
+                date_no_match = True
+            logger.debug(
+                "Date filter applied: %s to %s, filtered=%d matches",
+                date_range[0],
+                date_range[1],
+                len(filtered) if filtered else 0,
+            )
+
         t1 = time.time()
         if not matches_all:
             # 空ジェネレータを返す
+            no_result_msg = "関連するテキストが見つかりませんでした。"
+            if date_range:
+                no_result_msg = f"指定された期間（{date_range[0]} 〜 {date_range[1]}）に該当するデータが見つかりませんでした。"
             return {
                 "matches": [],
                 "meta": {
                     "candidates": 0,
                     "used_context_chunks": 0,
                     "used_context_chars": 0,
+                    "date_filter": date_range,
                     "timings_ms": {"retrieval": int((t1 - t0) * 1000.0), "prompt_build": 0},
                 },
-                "stream_fn": lambda: iter(("関連するテキストが見つかりませんでした。",)),
+                "stream_fn": lambda msg=no_result_msg: iter((msg,)),
             }
 
         # プロンプト用に上限を適用
@@ -570,7 +825,8 @@ class RAGService:
             trimmed["chunk_text"] = (head.get("chunk_text") or "")[: max(200, CONTEXT_MAX_CHARS // 2)]
             selected = [trimmed]
 
-        prompt = self._build_prompt(query, selected)
+        # 会話形式のプロンプトを生成
+        messages = self._build_chat_prompt(query, selected, chat_history)
         t2 = time.time()
 
         retrieval_s = (t1 - t0)
@@ -580,18 +836,7 @@ class RAGService:
             try:
                 with self._client.responses.stream(
                     model=COMPLETION_MODEL,
-                    input=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "あなたはRAGベースの社内QAアシスタントです。"
-                                "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
-                                "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
-                                "文体は簡潔で日本語、箇条書きを優先します。"
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
+                    input=messages,
                 ) as stream:
                     tgen0 = time.time()
                     for event in stream:
@@ -626,6 +871,10 @@ class RAGService:
             "candidates": len(matches_all),
             "used_context_chunks": len(selected),
             "used_context_chars": used_chars,
+            "date_filter": {"start": str(date_range[0]), "end": str(date_range[1])} if date_range else None,
+            "date_detected": date_detected,
+            "date_filtered": date_filtered,
+            "date_no_match": date_no_match,
             "limits": {"max_chunks": use_k, "max_chars": CONTEXT_MAX_CHARS},
             # 生成時間はUI側で計測し合算
             "timings_ms": {
