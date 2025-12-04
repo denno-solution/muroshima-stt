@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 import time
-from datetime import datetime, date, timedelta
-from typing import Dict, Iterable, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 from openai import OpenAI
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from models import (
@@ -21,6 +17,14 @@ from models import (
     LIBSQL_VECTOR_INDEX_NAME,
     USE_VECTOR,
     VECTOR_BACKEND,
+)
+from services.rag import (
+    LibsqlRetriever,
+    chunk_text,
+    filter_matches_by_date,
+    highlight_date_in_query,
+    parse_date_from_query,
+    build_chat_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +186,7 @@ class RAGService:
     def __init__(self) -> None:
         self._enabled = bool(USE_VECTOR) and ENABLE_RAG
         self._vector_backend = VECTOR_BACKEND
+        self._retriever = LibsqlRetriever(LIBSQL_VECTOR_INDEX_NAME)
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             if self._enabled:
@@ -199,7 +204,7 @@ class RAGService:
         if not self.enabled:
             return
 
-        chunks = list(self._chunk_text(text))
+        chunks = list(chunk_text(text, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP))
         if not chunks:
             logger.debug("RAG: チャンクなしのためスキップ (transcription_id=%s)", transcription_id)
             return
@@ -231,10 +236,10 @@ class RAGService:
 
         query_vector = query_embedding[0]
 
-        if self._vector_backend == "libsql":
-            rows = self._similarity_search_libsql(db, query_vector, top_k)
-        else:
+        if self._vector_backend != "libsql":
             return []
+
+        rows = self._retriever.similarity_search(db, query_vector, top_k)
 
         matches: List[Dict] = []
         for row in rows:
@@ -268,219 +273,25 @@ class RAGService:
 
         alpha: 0.0〜1.0（1.0でベクトルのみ、0.0でFTSのみ）
         """
-        if not self.enabled or not ENABLE_FTS:
+        if not self.enabled:
+            return []
+        if not ENABLE_FTS:
             return self.similarity_search(db, query, top_k)
 
         # 埋め込み生成
         qvecs = self._embed_texts([query])
         if not qvecs:
             # ベクトルが使えない場合はFTSのみ
-            return self._similarity_search_hybrid_fts_only(db, query, top_k)
+            return self._retriever.fts_only(db, query, top_k)
         qvec = qvecs[0]
 
         # 候補母集団の件数
         cand_k = max(top_k * HYBRID_CAND_MULT, top_k)
 
-        if self._vector_backend == "libsql":
-            return self._hybrid_libsql(db, query, qvec, top_k, cand_k, alpha)
-        else:
+        if self._vector_backend != "libsql":
             return []
 
-    # --- libSQL (Turso) 実装 ---
-    def _hybrid_libsql(
-        self,
-        db: Session,
-        query: str,
-        query_vector: List[float],
-        top_k: int,
-        cand_k: int,
-        alpha: float,
-    ) -> List[Dict]:
-        # ベクトル候補
-        vec_rows = self._libsql_vector_candidates(db, query_vector, cand_k)
-        # FTS候補
-        fts_rows = self._libsql_fts_candidates(db, query, cand_k)
-
-        return self._blend_and_fetch_libsql(db, vec_rows, fts_rows, top_k, alpha)
-
-    def _libsql_vector_candidates(self, db: Session, qvec: List[float], k: int) -> List[Dict]:
-        # libSQL の vector_top_k は距離を返さないため、基表に JOIN して
-        # vector_distance_cos で距離を計算してから返す。
-        stmt = text(
-            """
-            SELECT
-                i.id AS id,
-                vector_distance_cos(chunk.embedding, vector32(:q)) AS distance
-            FROM vector_top_k(:index_name, vector32(:q), :k) AS i
-            JOIN audio_transcription_chunks AS chunk ON chunk.id = i.id
-            """
-        )
-        rows = db.execute(
-            stmt,
-            {"index_name": LIBSQL_VECTOR_INDEX_NAME, "q": json.dumps(qvec), "k": k},
-        ).mappings().all()
-        return [dict(row) for row in rows]
-
-    def _libsql_fts_candidates(self, db: Session, query: str, k: int) -> List[Dict]:
-        # FTS5: bm25は小さいほど良い。後で 1/(1+bm25) に変換
-        try:
-            stmt = text(
-                """
-                SELECT rowid AS id, bm25(audio_transcription_chunks_fts) AS bm25
-                FROM audio_transcription_chunks_fts
-                WHERE audio_transcription_chunks_fts MATCH :q
-                ORDER BY bm25 LIMIT :k
-                """
-            )
-            rows = db.execute(stmt, {"q": query, "k": k}).mappings().all()
-        except Exception:
-            # FTS未構成時のフォールバック（LIKE検索、スコアは一律0.5）
-            like_stmt = text(
-                "SELECT id, 0.5 AS like_score FROM audio_transcription_chunks WHERE chunk_text LIKE :pat LIMIT :k"
-            )
-            rows = db.execute(
-                like_stmt, {"pat": f"%{query}%", "k": k}
-            ).mappings().all()
-            # 互換のため bm25 に変換（0.5 -> s_fts=0.5 => bm25 ~1.0 とみなす）
-            rows = [
-                {"id": r["id"], "bm25": 1.0}
-                for r in rows
-            ]
-        return [dict(row) for row in rows]
-
-    def _blend_and_fetch_libsql(
-        self,
-        db: Session,
-        vec_rows: List[Dict],
-        fts_rows: List[Dict],
-        top_k: int,
-        alpha: float,
-    ) -> List[Dict]:
-        # 正規化と結合
-        vec_map = {int(r["id"]): float(1.0 - float(r["distance"])) for r in vec_rows}
-        fts_map = {int(r["id"]): float(1.0 / (1.0 + max(0.0, float(r["bm25"])))) for r in fts_rows}
-
-        ids = set(vec_map) | set(fts_map)
-        scored: List[Tuple[int, float, float, float]] = []
-        for cid in ids:
-            v = max(0.0, min(1.0, vec_map.get(cid, 0.0)))
-            f = max(0.0, min(1.0, fts_map.get(cid, 0.0)))
-            s = alpha * v + (1.0 - alpha) * f
-            scored.append((cid, s, v, f))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_ids = [cid for cid, _, _, _ in scored[:top_k]]
-        if not top_ids:
-            return []
-
-        # メタ情報取得
-        ids_sql = ",".join(str(int(i)) for i in top_ids)
-        rows = db.execute(
-            text(
-                f"""
-                SELECT
-                    chunk.id AS chunk_id,
-                    chunk.chunk_text AS chunk_text,
-                    chunk.chunk_index AS chunk_index,
-                    trans."音声ID" AS transcription_id,
-                    trans."音声ファイルpath" AS file_path,
-                    trans."タグ" AS tag,
-                    trans."録音時刻" AS recorded_at,
-                    trans."録音時間" AS duration
-                FROM audio_transcription_chunks AS chunk
-                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
-                WHERE chunk.id IN ({ids_sql})
-                """
-            )
-        ).mappings().all()
-
-        row_map = {int(r["chunk_id"]): r for r in rows}
-        matches: List[Dict] = []
-        for cid, s, v, f in scored[:top_k]:
-            base = row_map.get(int(cid))
-            if not base:
-                continue
-            rec = dict(base)
-            rec["score"] = float(s)
-            rec["score_vector"] = float(v)
-            rec["score_fts"] = float(f)
-            matches.append(rec)
-        return matches
-
-    def _similarity_search_hybrid_fts_only(self, db: Session, query: str, top_k: int) -> List[Dict]:
-        # ベクトルが使えない場合の単純FTS検索（libSQL想定）
-        rows = self._libsql_fts_candidates(db, query, top_k)
-        ids = [int(r["id"]) for r in rows]
-        if not ids:
-            return []
-        ids_sql = ",".join(str(int(i)) for i in ids)
-        meta = db.execute(
-            text(
-                f"""
-                SELECT
-                    chunk.id AS chunk_id,
-                    chunk.chunk_text AS chunk_text,
-                    chunk.chunk_index AS chunk_index,
-                    trans."音声ID" AS transcription_id,
-                    trans."音声ファイルpath" AS file_path,
-                    trans."タグ" AS tag,
-                    trans."録音時刻" AS recorded_at,
-                    trans."録音時間" AS duration
-                FROM audio_transcription_chunks AS chunk
-                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
-                WHERE chunk.id IN ({ids_sql})
-                """
-            )
-        ).mappings().all()
-
-        row_map = {int(r["chunk_id"]): r for r in meta}
-        matches: List[Dict] = []
-        for r in rows[:top_k]:
-            base = row_map.get(int(r["id"]))
-            if not base:
-                continue
-            sim_fts = 1.0 / (1.0 + max(0.0, float(r.get("bm25", 1.0))))
-            rec = dict(base)
-            rec["score"] = float(sim_fts)
-            rec["score_vector"] = 0.0
-            rec["score_fts"] = float(sim_fts)
-            matches.append(rec)
-        return matches
-
-    # Postgres実装は削除（Turso専用化）
-
-    # 一括生成APIは廃止（streaming専用化）
-
-    def _similarity_search_libsql(
-        self, db: Session, query_vector: List[float], top_k: int
-    ) -> List[Dict]:
-        vector_literal = json.dumps(query_vector)
-        stmt = text(
-            """
-            SELECT
-                chunk.id AS chunk_id,
-                chunk.chunk_text AS chunk_text,
-                chunk.chunk_index AS chunk_index,
-                trans."音声ID" AS transcription_id,
-                trans."音声ファイルpath" AS file_path,
-                trans."タグ" AS tag,
-                trans."録音時刻" AS recorded_at,
-                trans."録音時間" AS duration,
-                vector_distance_cos(chunk.embedding, vector32(:query_vector)) AS distance
-            FROM vector_top_k(:index_name, vector32(:query_vector), :top_k) AS matches
-            JOIN audio_transcription_chunks AS chunk ON chunk.id = matches.id
-            JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
-            ORDER BY distance ASC
-            """
-        )
-
-        params = {
-            "index_name": LIBSQL_VECTOR_INDEX_NAME,
-            "query_vector": vector_literal,
-            "top_k": top_k,
-        }
-        rows = db.execute(stmt, params).mappings().all()
-        return rows
+        return self._retriever.hybrid_search(db, query, qvec, top_k, cand_k, alpha)
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not self._client:
@@ -503,90 +314,6 @@ class RAGService:
                     len(embedding) if embedding else None,
                 )
         return embeddings
-
-    def _chunk_text(self, text: str) -> Iterable[str]:
-        """句点ベースでチャンク化。日本語/英語混在にも対応するための簡易実装。"""
-
-        if not text:
-            return []
-
-        sentences = [s.strip() for s in re.split(r"(?<=[。．.!?！？])", text) if s and s.strip()]
-        if not sentences:
-            sentences = [text.strip()]
-
-        chunks: List[str] = []
-        current: List[str] = []
-        current_length = 0
-
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            sentence_length = len(sentence)
-            if current_length + sentence_length <= DEFAULT_CHUNK_SIZE:
-                current.append(sentence)
-                current_length += sentence_length
-                continue
-
-            # flush current chunk
-            if current:
-                chunks.append("".join(current))
-
-            # overlap処理
-            if DEFAULT_CHUNK_OVERLAP > 0 and chunks:
-                overlap_text = chunks[-1][-DEFAULT_CHUNK_OVERLAP:]
-                current = [overlap_text, sentence]
-                current_length = len(overlap_text) + sentence_length
-            else:
-                current = [sentence]
-                current_length = sentence_length
-
-        if current:
-            chunks.append("".join(current))
-
-        return chunks
-
-    def _build_prompt(self, query: str, matches: List[Dict]) -> str:
-        """回答用のプロンプトを生成。コンテキストに通し番号を付与し、引用しやすくする。"""
-        numbered_context = []
-        for i, match in enumerate(matches, start=1):
-            meta_parts = []
-            if match.get("file_path"):
-                meta_parts.append(f"ファイル: {match['file_path']}")
-            if match.get("tag"):
-                meta_parts.append(f"タグ: {match['tag']}")
-            if match.get("recorded_at"):
-                meta_parts.append(f"録音時刻: {match['recorded_at']}")
-            meta = " / ".join(meta_parts)
-            header = (
-                f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
-            )
-            numbered_context.append(f"{header}\n{match['chunk_text']}")
-
-        context_block = "\n\n".join(numbered_context)
-
-        # 出力スタイルはここで明示する（拒否よりも「分かっていること/不足していること」を優先）。
-        instructions = (
-            "あなたは社内の音声文字起こしデータを根拠に回答する日本語アシスタントです。"  # 役割
-            "事実は必ず下のコンテキスト内から根拠を取り、出典として [#番号] を示してください。"  # 根拠と引用
-            "根拠が完全には揃わない場合でも、\"分かっていること\"と\"不足情報\"を分けて簡潔に答えてください。"  # 過度な拒否の抑制
-            "日付や時刻は可能なら YYYY-MM-DD 形式で明示してください。"  # 日付の明確化
-        )
-
-        # 回答のフォーマットを固定化して安定させる
-        output_format = (
-            "出力は次の3セクションで返してください:\n"
-            "1) 回答:\n- 箇条書きで要点のみ（最大5項目）。\n"
-            "2) 根拠:\n- 参照した [#番号] と短い引用/要約（1〜3件）。\n"
-            "3) 不足情報/前提:\n- 追加で必要な情報や不確実な点。"
-        )
-
-        return (
-            f"{instructions}\n\n"
-            f"コンテキスト（番号付き）:\n{context_block}\n\n"
-            f"質問:\n{query}\n\n"
-            f"{output_format}"
-        )
 
     def _generate_answer(self, prompt: str) -> str:
         if not self._client:
@@ -643,99 +370,6 @@ class RAGService:
         text_joined = "\n".join(out).strip()
         return text_joined or "回答を生成できませんでした。"
 
-    def _filter_by_date(self, matches: List[Dict], date_range: Tuple[date, date]) -> List[Dict]:
-        """検索結果を日付範囲でフィルタリング。"""
-        start_date, end_date = date_range
-        filtered = []
-        for m in matches:
-            recorded_at = m.get("recorded_at")
-            if not recorded_at:
-                continue
-            # datetime型またはstring型を処理
-            if isinstance(recorded_at, str):
-                try:
-                    recorded_date = datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).date()
-                except (ValueError, TypeError):
-                    try:
-                        # 別のフォーマットを試す
-                        recorded_date = datetime.strptime(recorded_at[:10], "%Y-%m-%d").date()
-                    except (ValueError, TypeError):
-                        continue
-            elif isinstance(recorded_at, datetime):
-                recorded_date = recorded_at.date()
-            elif isinstance(recorded_at, date):
-                recorded_date = recorded_at
-            else:
-                continue
-
-            if start_date <= recorded_date <= end_date:
-                filtered.append(m)
-        return filtered
-
-    def _build_chat_prompt(
-        self,
-        query: str,
-        matches: List[Dict],
-        chat_history: Optional[List[Dict]] = None,
-    ) -> List[Dict]:
-        """会話履歴を含むプロンプトを生成。OpenAI Responses API形式で返す。"""
-        # コンテキストブロックを生成
-        numbered_context = []
-        for i, match in enumerate(matches, start=1):
-            meta_parts = []
-            if match.get("file_path"):
-                meta_parts.append(f"ファイル: {match['file_path']}")
-            if match.get("tag"):
-                meta_parts.append(f"タグ: {match['tag']}")
-            if match.get("recorded_at"):
-                recorded = match["recorded_at"]
-                if isinstance(recorded, datetime):
-                    recorded = recorded.strftime("%Y-%m-%d %H:%M")
-                elif isinstance(recorded, date):
-                    recorded = recorded.strftime("%Y-%m-%d")
-                meta_parts.append(f"録音日時: {recorded}")
-            meta = " / ".join(meta_parts)
-            header = (
-                f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
-            )
-            numbered_context.append(f"{header}\n{match['chunk_text']}")
-
-        context_block = "\n\n".join(numbered_context)
-
-        system_content = (
-            "あなたはRAGベースの社内QAアシスタントです。"
-            "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
-            "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
-            "文体は簡潔で日本語、箇条書きを優先します。"
-            "会話の文脈を維持し、前の質問への回答と関連付けて答えてください。"
-        )
-
-        messages = [{"role": "system", "content": system_content}]
-
-        # 会話履歴を追加（最新5ターン程度に制限）
-        if chat_history:
-            # 履歴は (user, assistant) のペアで構成されている想定
-            recent_history = chat_history[-10:]  # 最新10メッセージ
-            for msg in recent_history:
-                role = msg.get("role")
-                content = msg.get("content", "")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-
-        # 現在のクエリとコンテキストを追加
-        user_prompt = (
-            f"以下のコンテキスト（番号付き）を参照して質問に答えてください。\n\n"
-            f"コンテキスト:\n{context_block}\n\n"
-            f"質問:\n{query}\n\n"
-            f"出力は次の3セクションで返してください:\n"
-            f"1) 回答: 箇条書きで要点のみ（最大5項目）。\n"
-            f"2) 根拠: 参照した [#番号] と短い引用/要約（1〜3件）。\n"
-            f"3) 不足情報/前提: 追加で必要な情報や不確実な点。"
-        )
-        messages.append({"role": "user", "content": user_prompt})
-
-        return messages
-
     # --- Streaming API ---
     def answer_stream(
         self,
@@ -772,7 +406,7 @@ class RAGService:
         date_detected = date_range is not None
         date_no_match = False
         if date_range and matches_all:
-            filtered = self._filter_by_date(matches_all, date_range)
+            filtered = filter_matches_by_date(matches_all, date_range)
             if filtered:
                 # 日付でフィルタした結果を優先使用
                 matches_all = filtered
@@ -826,7 +460,7 @@ class RAGService:
             selected = [trimmed]
 
         # 会話形式のプロンプトを生成
-        messages = self._build_chat_prompt(query, selected, chat_history)
+        messages = build_chat_prompt(query, selected, chat_history)
         t2 = time.time()
 
         retrieval_s = (t1 - t0)
