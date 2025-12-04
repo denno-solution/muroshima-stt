@@ -5,7 +5,8 @@ import streamlit as st
 from datetime import datetime, date
 
 from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db, RAGChatLog
-from services.rag_service import get_rag_service, highlight_date_in_query
+from services.rag import highlight_date_in_query
+from services.rag_service import get_rag_service
 
 
 def run_rag_tab():
