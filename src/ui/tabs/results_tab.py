@@ -9,19 +9,19 @@ def run_results_tab():
         return
 
     for idx, result in enumerate(st.session_state.transcriptions):
-        with st.expander(f"📁 {result['ファイル名']}", expanded=True):
+        with st.expander(f"📁 {result['file_name']}", expanded=True):
             col1, col2 = st.columns([1, 1])
             with col1:
                 st.subheader("基本情報")
-                st.write(f"**録音時刻:** {result['録音時刻'].strftime('%Y/%m/%d %H:%M')}")
-                st.write(f"**録音時間:** {result['録音時間']:.1f}秒")
-                st.write(f"**タグ:** {result['タグ']}")
+                st.write(f"**録音時刻:** {result['created_at'].strftime('%Y/%m/%d %H:%M')}")
+                st.write(f"**録音時間:** {result['duration_seconds']:.1f}秒")
+                st.write(f"**タグ:** {result['tags']}")
                 st.subheader("文字起こしテキスト")
-                st.text_area("", result['文字起こしテキスト'], height=200, key=f"text_{idx}")
+                st.text_area("", result['transcript'], height=200, key=f"text_{idx}")
             with col2:
-                if result.get('構造化データ'):
+                if result.get('structured_json'):
                     st.subheader("構造化データ")
-                    st.json(result['構造化データ'])
+                    st.json(result['structured_json'])
                 else:
                     st.info("構造化データはありません")
 

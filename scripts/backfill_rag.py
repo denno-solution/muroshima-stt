@@ -29,7 +29,7 @@ def main() -> None:
 
     db = next(get_db())
     try:
-        records = db.query(AudioTranscription).order_by(AudioTranscription.音声ID).all()
+        records = db.query(AudioTranscription).order_by(AudioTranscription.id).all()
         if not records:
             print("バックフィル対象のレコードはありません。")
             return
@@ -38,8 +38,8 @@ def main() -> None:
         processed = 0
         for chunk in _batched(records, BATCH_SIZE):
             for row in chunk:
-                text = row.文字起こしテキスト or ""
-                rag.index_transcription(db, row.音声ID, text)
+                text = row.transcript or ""
+                rag.index_transcription(db, row.id, text)
                 processed += 1
             db.commit()
             print(f"{processed}/{total} 件を処理しました")

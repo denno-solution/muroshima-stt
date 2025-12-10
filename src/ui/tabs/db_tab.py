@@ -26,7 +26,7 @@ def _ensure_state():
 def _load_db_records():
     db = next(get_db())
     try:
-        records = db.query(AudioTranscription).order_by(AudioTranscription.録音時刻.desc()).all()
+        records = db.query(AudioTranscription).order_by(AudioTranscription.created_at.desc()).all()
     finally:
         db.close()
 
@@ -41,12 +41,12 @@ def _load_db_records():
     detail_rows = []
 
     for record in records:
-        text = record.文字起こしテキスト or ""
-        tag_value = record.タグ or ""
+        text = record.transcript or ""
+        tag_value = record.tags or ""
         download_url = None
 
         if r2_cfg is not None:
-            key = build_object_key_for_filename(record.音声ファイルpath, r2_cfg)
+            key = build_object_key_for_filename(record.file_path, r2_cfg)
             if key:
                 exists = r2_cache.get(key)
                 if exists is None:
@@ -58,24 +58,22 @@ def _load_db_records():
                     )
 
         table_rows.append({
-            "音声ID": record.音声ID,
-            "発言人数": record.発言人数,
-            "録音時刻": record.録音時刻,
-            "録音時間(s)": record.録音時間,
+            "ID": record.id,
+            "録音時刻": record.created_at,
+            "録音時間(s)": record.duration_seconds,
             "タグ": tag_value,
             "文字起こし": text[:50] + "..." if len(text) > 50 else text,
             "音声ファイルダウンロード": download_url,
         })
 
         detail_rows.append({
-            "音声ID": record.音声ID,
-            "音声ファイルpath": record.音声ファイルpath,
-            "発言人数": record.発言人数,
-            "録音時刻": record.録音時刻,
-            "録音時間": record.録音時間,
-            "タグ": tag_value,
-            "文字起こしテキスト": text,
-            "構造化データ": record.構造化データ,
+            "id": record.id,
+            "file_path": record.file_path,
+            "created_at": record.created_at,
+            "duration_seconds": record.duration_seconds,
+            "tags": tag_value,
+            "transcript": text,
+            "structured_json": record.structured_json,
             "download_url": download_url,
         })
 
@@ -116,12 +114,12 @@ def run_db_tab():
         st.info("データベースにレコードがありません。")
         return
 
-    tag_options = ["すべて"] + sorted({row["タグ"] for row in records if row["タグ"]})
-    if "タグ選択" not in st.session_state:
-        st.session_state["タグ選択"] = "すべて"
+    tag_options = ["すべて"] + sorted({row["tags"] for row in records if row["tags"]})
+    if "tag_filter" not in st.session_state:
+        st.session_state["tag_filter"] = "すべて"
 
-    selected_tag = st.selectbox("タグでフィルタ", tag_options, index=0 if st.session_state["タグ選択"] not in tag_options else tag_options.index(st.session_state["タグ選択"]))
-    st.session_state["タグ選択"] = selected_tag
+    selected_tag = st.selectbox("タグでフィルタ", tag_options, index=0 if st.session_state["tag_filter"] not in tag_options else tag_options.index(st.session_state["tag_filter"]))
+    st.session_state["tag_filter"] = selected_tag
 
     filtered_df = df if selected_tag == "すべて" else df[df["タグ"] == selected_tag]
 
@@ -139,25 +137,24 @@ def run_db_tab():
     )
 
     if not filtered_df.empty and st.checkbox("詳細を表示"):
-        record_map = {row["音声ID"]: row for row in records}
-        selected_id = st.selectbox("音声IDを選択", filtered_df["音声ID"].tolist())
+        record_map = {row["id"]: row for row in records}
+        selected_id = st.selectbox("IDを選択", filtered_df["ID"].tolist())
         record = record_map.get(selected_id)
 
         if record:
-            st.subheader(f"音声ID: {record['音声ID']} の詳細")
+            st.subheader(f"ID: {record['id']} の詳細")
             col1, col2 = st.columns([1, 1])
             with col1:
-                st.write(f"**ファイル:** {record['音声ファイルpath']}")
-                st.write(f"**発言人数:** {record['発言人数']}")
-                st.write(f"**録音時刻:** {record['録音時刻']}")
-                st.write(f"**録音時間:** {record['録音時間']}秒")
-                st.write(f"**タグ:** {record['タグ'] or '-'}")
+                st.write(f"**ファイル:** {record['file_path']}")
+                st.write(f"**録音時刻:** {record['created_at']}")
+                st.write(f"**録音時間:** {record['duration_seconds']}秒")
+                st.write(f"**タグ:** {record['tags'] or '-'}")
                 st.subheader("文字起こしテキスト")
-                st.text_area("", record["文字起こしテキスト"], height=200)
+                st.text_area("", record["transcript"], height=200)
             with col2:
-                if record["構造化データ"]:
+                if record["structured_json"]:
                     st.subheader("構造化データ")
-                    st.json(record["構造化データ"])
+                    st.json(record["structured_json"])
                 if record["download_url"]:
                     st.subheader("ダウンロード")
                     st.link_button("Cloudflare R2 からダウンロード", record["download_url"])

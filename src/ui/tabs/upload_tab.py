@@ -102,13 +102,12 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                             tags = text_structurer.extract_tags(structured_data)
 
                     result = {
-                        "ファイル名": uploaded_file.name,
-                        "録音時刻": datetime.now(),
-                        "録音時間": duration,
-                        "文字起こしテキスト": transcription,
-                        "構造化データ": structured_data,
-                        "タグ": tags,
-                        "発言人数": 1,
+                        "file_name": uploaded_file.name,
+                        "created_at": datetime.now(),
+                        "duration_seconds": duration,
+                        "transcript": transcription,
+                        "structured_json": structured_data,
+                        "tags": tags,
                     }
 
                     st.session_state.transcriptions.append(result)
@@ -116,20 +115,19 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                     db = next(get_db())
                     try:
                         audio_record = AudioTranscription(
-                            音声ファイルpath=uploaded_file.name,
-                            発言人数=1,
-                            録音時刻=datetime.now(),
-                            録音時間=duration,
-                            文字起こしテキスト=transcription,
-                            構造化データ=structured_data,
-                            タグ=tags,
+                            file_path=uploaded_file.name,
+                            created_at=datetime.now(),
+                            duration_seconds=duration,
+                            transcript=transcription,
+                            structured_json=structured_data,
+                            tags=tags,
                         )
                         db.add(audio_record)
                         db.flush()
 
                         if rag_service.enabled:
                             try:
-                                rag_service.index_transcription(db, audio_record.音声ID, transcription)
+                                rag_service.index_transcription(db, audio_record.id, transcription)
                             except Exception as exc:  # pragma: no cover - API例外
                                 logger.error("RAG埋め込みの生成に失敗: %s", exc, exc_info=True)
 

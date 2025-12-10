@@ -24,15 +24,15 @@ class LibsqlRetriever:
                 chunk.id AS chunk_id,
                 chunk.chunk_text AS chunk_text,
                 chunk.chunk_index AS chunk_index,
-                trans."音声ID" AS transcription_id,
-                trans."音声ファイルpath" AS file_path,
-                trans."タグ" AS tag,
-                trans."録音時刻" AS recorded_at,
-                trans."録音時間" AS duration,
+                trans.id AS transcription_id,
+                trans.file_path AS file_path,
+                trans.tags AS tag,
+                trans.created_at AS recorded_at,
+                trans.duration_seconds AS duration,
                 vector_distance_cos(chunk.embedding, vector32(:query_vector)) AS distance
             FROM vector_top_k(:index_name, vector32(:query_vector), :top_k) AS matches
             JOIN audio_transcription_chunks AS chunk ON chunk.id = matches.id
-            JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+            JOIN audio_transcriptions AS trans ON trans.id = chunk.transcription_id
             ORDER BY distance ASC
             """
         )
@@ -71,13 +71,13 @@ class LibsqlRetriever:
                     chunk.id AS chunk_id,
                     chunk.chunk_text AS chunk_text,
                     chunk.chunk_index AS chunk_index,
-                    trans."音声ID" AS transcription_id,
-                    trans."音声ファイルpath" AS file_path,
-                    trans."タグ" AS tag,
-                    trans."録音時刻" AS recorded_at,
-                    trans."録音時間" AS duration
+                    trans.id AS transcription_id,
+                    trans.file_path AS file_path,
+                    trans.tags AS tag,
+                    trans.created_at AS recorded_at,
+                    trans.duration_seconds AS duration
                 FROM audio_transcription_chunks AS chunk
-                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+                JOIN audio_transcriptions AS trans ON trans.id = chunk.transcription_id
                 WHERE chunk.id IN ({ids_sql})
                 """
             )
@@ -165,13 +165,13 @@ class LibsqlRetriever:
                     chunk.id AS chunk_id,
                     chunk.chunk_text AS chunk_text,
                     chunk.chunk_index AS chunk_index,
-                    trans."音声ID" AS transcription_id,
-                    trans."音声ファイルpath" AS file_path,
-                    trans."タグ" AS tag,
-                    trans."録音時刻" AS recorded_at,
-                    trans."録音時間" AS duration
+                    trans.id AS transcription_id,
+                    trans.file_path AS file_path,
+                    trans.tags AS tag,
+                    trans.created_at AS recorded_at,
+                    trans.duration_seconds AS duration
                 FROM audio_transcription_chunks AS chunk
-                JOIN audio_transcriptions AS trans ON trans."音声ID" = chunk.transcription_id
+                JOIN audio_transcriptions AS trans ON trans.id = chunk.transcription_id
                 WHERE chunk.id IN ({ids_sql})
                 """
             )

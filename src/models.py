@@ -77,14 +77,15 @@ def _strip_auth_token_from_url(url: str) -> str:
 class AudioTranscription(Base):
     __tablename__ = 'audio_transcriptions'
 
-    音声ID = Column(Integer, primary_key=True, autoincrement=True)
-    音声ファイルpath = Column(String(500), nullable=False)
-    発言人数 = Column(Integer, default=1)
-    録音時刻 = Column(DateTime, nullable=False, default=datetime.now)
-    録音時間 = Column(Float, nullable=False)  # 秒単位
-    文字起こしテキスト = Column(Text, nullable=False)
-    構造化データ = Column(JSON, nullable=True)
-    タグ = Column(String(200), nullable=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    file_path = Column(String(500), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    duration_seconds = Column(Float, nullable=False)
+    transcript = Column(Text, nullable=False)
+    structured_json = Column(JSON, nullable=True)
+    tags = Column(String(200), nullable=True)
+    model_id = Column(String(100), nullable=True)
+    language_code = Column(String(10), nullable=True)
     chunks = relationship(
         "AudioTranscriptionChunk",
         back_populates="transcription",
@@ -92,7 +93,7 @@ class AudioTranscription(Base):
     )
 
     def __repr__(self):
-        return f"<AudioTranscription(音声ID={self.音声ID}, ファイル={self.音声ファイルpath})>"
+        return f"<AudioTranscription(id={self.id}, file_path={self.file_path})>"
 
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./audio_transcriptions.db')
@@ -177,7 +178,7 @@ class AudioTranscriptionChunk(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     transcription_id = Column(
         Integer,
-        ForeignKey('audio_transcriptions.音声ID', ondelete="CASCADE"),
+        ForeignKey('audio_transcriptions.id', ondelete="CASCADE"),
         nullable=False,
     )
     chunk_index = Column(Integer, nullable=False)

@@ -176,14 +176,13 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                             logger.error(f"R2アップロード失敗: {exc}")
 
                 result = {
-                    "ファイル名": final_filename,
-                    "録音時刻": timestamp,
-                    "録音時間": duration,
-                    "文字起こしテキスト": transcription,
-                    "構造化データ": structured_data,
-                    "タグ": tags,
-                    "発言人数": 1,
-                    "保存先": final_path,
+                    "file_name": final_filename,
+                    "created_at": timestamp,
+                    "duration_seconds": duration,
+                    "transcript": transcription,
+                    "structured_json": structured_data,
+                    "tags": tags,
+                    "save_path": final_path,
                     "r2_url": (r2_info or {}).get("url") if (r2_info) else None,
                     "r2_bucket": (r2_info or {}).get("bucket") if (r2_info) else None,
                     "r2_key": (r2_info or {}).get("key") if (r2_info) else None,
@@ -195,25 +194,24 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                 db = next(get_db())
                 try:
                     audio_record = AudioTranscription(
-                        音声ファイルpath=result["ファイル名"],
-                        発言人数=1,
-                        録音時刻=timestamp,
-                        録音時間=duration,
-                        文字起こしテキスト=transcription,
-                        構造化データ=structured_data,
-                        タグ=tags,
+                        file_path=result["file_name"],
+                        created_at=timestamp,
+                        duration_seconds=duration,
+                        transcript=transcription,
+                        structured_json=structured_data,
+                        tags=tags,
                     )
                     db.add(audio_record)
                     db.flush()
 
                     if rag_service.enabled:
                         try:
-                            rag_service.index_transcription(db, audio_record.音声ID, transcription)
+                            rag_service.index_transcription(db, audio_record.id, transcription)
                         except Exception as exc:  # pragma: no cover - API例外
                             logger.error("RAG埋め込みの生成に失敗: %s", exc, exc_info=True)
 
                     db.commit()
-                    logger.info(f"マイク録音結果をデータベースに保存: {result['ファイル名']}")
+                    logger.info(f"マイク録音結果をデータベースに保存: {result['file_name']}")
                 except Exception:
                     db.rollback()
                     raise
@@ -234,8 +232,8 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                     else:
                         st.info("構造化データはありません")
                     st.subheader("保存情報")
-                    if save_local and result.get("保存先"):
-                        st.success(f"ローカル保存: {result['保存先']}")
+                    if save_local and result.get("save_path"):
+                        st.success(f"ローカル保存: {result['save_path']}")
                     elif save_local:
                         st.warning("ローカル保存が有効ですが保存に失敗しました")
                     else:
