@@ -197,12 +197,14 @@ class RAGChatLog(Base):
     __tablename__ = 'rag_chat_logs'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), nullable=True, index=True)  # セッション管理用UUID
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     user_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=True)
     contexts = Column(JSON, nullable=True)  # 参照したチャンクやスコアを保持
     used_hybrid = Column(Boolean, default=True, nullable=False)
     alpha = Column(Float, nullable=True)
+    date_filter_applied = Column(Boolean, default=False, nullable=True)  # 日付フィルタ適用有無
 
 # データベース接続設定
 engine_kwargs = dict(echo=False)
