@@ -85,6 +85,133 @@ def build_sidebar(settings: AppSettings, log_dir: Path, logger):
 
     st.divider()
 
+    # 社長音声: 参照フォルダ
+    st.subheader("🎤 社長音声")
+    current_source_dir = settings.get_ceo_source_dir()
+
+    # text_input のキーに対しては、ウィジェット生成後に session_state を直接書き換えできない
+    # ため、選択/リセットは on_click コールバック内で session_state を更新する。
+    if "sidebar_ceo_source_dir" not in st.session_state:
+        st.session_state["sidebar_ceo_source_dir"] = current_source_dir
+
+    def _pick_ceo_source_dir():
+        """OS ネイティブのフォルダ選択ダイアログを起動して session_state に反映する。"""
+
+        import platform
+        import subprocess
+        import sys as _sys
+
+        initial = st.session_state.get("sidebar_ceo_source_dir") or str(Path.home())
+        picked = ""
+        error_message: Optional[str] = None
+
+        try:
+            if platform.system() == "Darwin":
+                script = (
+                    'tell application "Finder" to activate\n'
+                    f'set targetFolder to choose folder with prompt "社長音声の参照フォルダを選択" default location POSIX file "{initial}"\n'
+                    "return POSIX path of targetFolder"
+                )
+                proc = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if proc.returncode == 0:
+                    picked = (proc.stdout or "").strip().rstrip("/")
+                else:
+                    stderr = (proc.stderr or "").strip()
+                    if "User canceled" in stderr or "User cancelled" in stderr or proc.returncode == 1:
+                        picked = ""  # ユーザーキャンセル
+                    else:
+                        error_message = stderr[:300] or f"exit {proc.returncode}"
+            else:
+                picker_code = (
+                    "import tkinter as tk\n"
+                    "from tkinter import filedialog\n"
+                    "root = tk.Tk()\n"
+                    "root.withdraw()\n"
+                    "root.attributes('-topmost', True)\n"
+                    f"picked = filedialog.askdirectory(title='社長音声の参照フォルダを選択', initialdir={initial!r}, mustexist=True)\n"
+                    "root.destroy()\n"
+                    "print(picked or '', end='')\n"
+                )
+                proc = subprocess.run(
+                    [_sys.executable, "-c", picker_code],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if proc.returncode != 0:
+                    error_message = (
+                        f"picker subprocess exited {proc.returncode}: "
+                        f"{(proc.stderr or '').strip()[:300]}"
+                    )
+                else:
+                    picked = (proc.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            error_message = "フォルダ選択ダイアログがタイムアウトしました（5分）"
+            logger.warning("ceo source picker timed out")
+        except Exception as exc:
+            error_message = str(exc)
+            logger.warning(f"ceo source picker failed: {exc}")
+
+        if error_message:
+            st.session_state["_ceo_pick_error"] = error_message
+        elif picked:
+            st.session_state["sidebar_ceo_source_dir"] = picked
+            settings.set_ceo_source_dir(picked)
+            logger.info(f"社長音声 参照フォルダを選択ダイアログから保存: {picked}")
+        # picked == "" かつエラーなしはキャンセル扱い、何もしない
+
+    def _reset_ceo_source_dir():
+        st.session_state["sidebar_ceo_source_dir"] = ""
+        settings.set_ceo_source_dir("")
+        logger.info("社長音声 参照フォルダをリセット")
+
+    ceo_source_dir = st.text_input(
+        "参照フォルダ（サーバー側パス）",
+        key="sidebar_ceo_source_dir",
+        help=(
+            "「未処理を自動取り込み」で再帰スキャンするフォルダの絶対パスを指定します。"
+            "Streamlit はサーバー側で動くため、サーバー上で読めるパスを指定してください。"
+        ),
+        placeholder="例: /var/data/ceo_audio または C:\\\\ceo_audio",
+    )
+    col_pick, col_reset = st.columns([1, 1])
+    with col_pick:
+        st.button(
+            "📁 選択",
+            use_container_width=True,
+            key="sidebar_ceo_source_pick",
+            help="サーバー側のフォルダ選択ダイアログを開きます（ローカル実行時のみ動作）",
+            on_click=_pick_ceo_source_dir,
+        )
+    with col_reset:
+        st.button(
+            "🗑️ リセット",
+            use_container_width=True,
+            key="sidebar_ceo_source_reset",
+            disabled=not st.session_state.get("sidebar_ceo_source_dir"),
+            help="参照フォルダの設定をクリアします",
+            on_click=_reset_ceo_source_dir,
+        )
+
+    # 直前のフォルダ選択で発生したエラーがあれば表示してクリア
+    if "_ceo_pick_error" in st.session_state:
+        st.error(
+            f"フォルダ選択ダイアログを開けませんでした: {st.session_state.pop('_ceo_pick_error')}\n"
+            "手で入力欄にパスを貼り付けてください。"
+        )
+
+    # 手入力での変更も永続化（コールバック経由の変更とは別経路）
+    if ceo_source_dir.strip() != current_source_dir:
+        settings.set_ceo_source_dir(ceo_source_dir)
+        logger.info(f"社長音声 参照フォルダを保存: {ceo_source_dir.strip()}")
+
+    st.divider()
+
     # デバッグ
     st.subheader("🐛 デバッグ設定")
     debug_mode = st.checkbox("デバッグモードを有効化", value=settings.get_debug_mode())

@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -54,6 +54,7 @@ def trim_non_speech(
     pad_ms: int = 150,
     min_out_ms: int = 500,
     target_sr: int = 16000,
+    output_path: Optional[str] = None,
 ) -> VADResult:
     """音声ファイルから人声以外の区間（無音/雑音）をカットしてWAVを出力。
 
@@ -66,8 +67,11 @@ def trim_non_speech(
     orig_audio, orig_sr = librosa.load(input_path, sr=None, mono=True)
     orig_sec = float(len(orig_audio) / orig_sr if orig_sr else 0.0)
 
-    out_dir = Path(input_path).parent
-    out_path = str(Path(input_path).with_suffix("") ) + "_vad.wav"
+    if output_path:
+        out_path = str(Path(output_path))
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = str(Path(input_path).with_suffix("")) + "_vad.wav"
 
     if not enabled:
         # 変換のみ: STTの互換性を維持するため16kHzに変換して保存
@@ -156,4 +160,3 @@ def trim_non_speech(
             method = "energy"
         sf.write(out_path, trimmed, target_sr)
         return VADResult(True, method, input_path, out_path, orig_sec, out_sec)
-

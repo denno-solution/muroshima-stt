@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 import logging
@@ -97,3 +98,12 @@ class AppSettings:
 
     def set_vad_aggressiveness(self, val: int):
         self.set("vad_aggressiveness", int(max(0, min(3, val))))
+
+    # --- 社長音声: 参照フォルダ（サーバー側パス） ---
+    def get_ceo_source_dir(self) -> str:
+        # ストア値 > 環境変数 > 空文字
+        val = self.get("ceo_source_dir", "") or os.getenv("CEO_SOURCE_DIR", "")
+        return (val or "").strip()
+
+    def set_ceo_source_dir(self, path: str):
+        self.set("ceo_source_dir", (path or "").strip())

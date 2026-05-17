@@ -10,6 +10,8 @@ from ui.tabs.mic_tab import run_mic_tab
 from ui.tabs.results_tab import run_results_tab
 from ui.tabs.db_tab import run_db_tab
 from ui.tabs.rag_tab import run_rag_tab
+from ui.tabs.ceo_tab import run_ceo_tab
+from ui.tabs.ceo_db_tab import run_ceo_db_tab
 # .envファイルを読み込む
 load_dotenv()
 
@@ -68,27 +70,37 @@ if "mic_processing" not in st.session_state:
     st.session_state.mic_processing = False
 if "mic_audio_bytes" not in st.session_state:
     st.session_state.mic_audio_bytes = None
-if "settings" not in st.session_state:
-    st.session_state.settings = settings
+# AppSettings はディスク（.app_settings.json）から毎回ロードされるため、
+# session_state には常に最新の参照を入れ替えておく。
+# 初回ガード（"settings" not in st.session_state）にすると、画面再描画後に
+# CEO タブ等から取り出すインスタンスが古いままになり「保存したのに反映されない」
+# 症状になる（実際にそれで参照フォルダが「未設定」表示になっていた）。
+st.session_state.settings = settings
 
 with st.sidebar:
     selected_model, use_structuring, debug_mode = build_sidebar(settings, log_dir, logger)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab_ceo, tab3, tab4, tab_ceo_db, tab5 = st.tabs([
     "📤 アップロード",
     "🎙️ マイク録音",
+    "🎤 社長音声",
     "📊 処理結果",
     "🗄️ データベース",
+    "📂 社長音声履歴",
     "💬 QA検索",
 ])
 with tab1:
     run_upload_tab(selected_model, use_structuring, logger)
 with tab2:
     run_mic_tab(selected_model, use_structuring, logger)
+with tab_ceo:
+    run_ceo_tab(selected_model, logger)
 with tab3:
     run_results_tab()
 with tab4:
     run_db_tab()
+with tab_ceo_db:
+    run_ceo_db_tab()
 with tab5:
     run_rag_tab()
 

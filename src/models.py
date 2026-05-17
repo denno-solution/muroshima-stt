@@ -96,6 +96,32 @@ class AudioTranscription(Base):
         return f"<AudioTranscription(id={self.id}, file_path={self.file_path})>"
 
 
+class CeoTranscription(Base):
+    """社長音声の文字起こし結果。stt-desktop の ceo_transcriptions テーブルと互換。"""
+
+    __tablename__ = 'ceo_transcriptions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    file_path = Column(String(500), nullable=False)
+    local_file_path = Column(String(500), nullable=True)
+    source_file_path = Column(String(500), nullable=True)
+    source_file_size_bytes = Column(Integer, nullable=True)
+    source_file_modified_at = Column(String(64), nullable=True)
+    title = Column(String(500), nullable=True)
+    speaker = Column(String(200), nullable=True)
+    recorded_at = Column(String(64), nullable=True)
+    model_id = Column(String(100), nullable=True)
+    language_code = Column(String(10), nullable=True)
+    transcript = Column(Text, nullable=False)
+    structured_json = Column(JSON, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    tags = Column(String(200), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    def __repr__(self):
+        return f"<CeoTranscription(id={self.id}, title={self.title})>"
+
+
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./audio_transcriptions.db')
 IS_LIBSQL = _is_libsql(DATABASE_URL)
 
