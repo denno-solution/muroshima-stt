@@ -1,18 +1,11 @@
 """社長音声タブ。
 
-stt-desktop の CeoView を Streamlit 向けに移植したもの。
-UI 構成は desktop に合わせている:
-  - 参照フォルダ表示
-  - 「未処理を自動取り込み」「音声ファイルを選択」ボタン
-  - 「最新スキャン結果」4カラム（スキャン後のみ）
-  - 「一括アップロード / 順次処理」キュー（常時表示）
-  - 「処理結果」グリッド（常時表示、待機中は "-"）
+Web版では、ブラウザのマイク録音を社長音声として `ceo_transcriptions` に保存する。
 """
 
 from __future__ import annotations
 
 import html
-import os
 import tempfile
 from datetime import datetime
 from hashlib import sha256
@@ -26,11 +19,7 @@ from services.ceo_processor import (
     DEFAULT_CEO_SPEAKER,
     CeoBatchSummary,
     CeoProcessResult,
-    CeoScanResult,
-    CeoSourceFileEntry,
-    process_ceo_path,
     process_ceo_uploaded_path,
-    scan_ceo_source_directory,
 )
 
 
@@ -45,26 +34,9 @@ def _ensure_state() -> dict:
         "ceo_tab_state",
         {
             "last_summary": None,   # CeoBatchSummary | None
-            "last_scan": None,      # CeoScanResult | None
-            "pending": None,        # dict | None — モーダルで取り込み待ちのファイル群
             "active_idx": 0,        # 「処理結果」で表示する結果のインデックス
-            "uploader_key": 0,
         },
     )
-
-
-def _ceo_source_dir() -> str:
-    """参照フォルダの優先順: AppSettings (.app_settings.json) > 環境変数。"""
-
-    app_settings = st.session_state.get("settings")
-    if app_settings is not None:
-        try:
-            v = app_settings.get_ceo_source_dir()
-            if v:
-                return v
-        except Exception:
-            pass
-    return os.getenv("CEO_SOURCE_DIR", "").strip()
 
 
 def _format_duration(value) -> str:
@@ -87,18 +59,6 @@ def _format_datetime(value: Optional[str]) -> str:
 
 def _html_text(value) -> str:
     return html.escape(str(value or ""), quote=True)
-
-
-# ---------- pending payload structure ----------
-# pending = {
-#   "source": "upload" | "scan" | "mic",
-#   "files": [
-#       {
-#         source_kind, file_path|None, temp_file_path|None, file_name,
-#         size_bytes, modified_at|None, source_file_hash|None
-#       }, ...
-#   ],
-# }
 
 
 def _ceo_vad_settings() -> tuple[bool, int]:
@@ -127,9 +87,9 @@ def _suffix_from_audio_upload(uf, default: str = ".webm") -> str:
 def _persist_uploaded_file(
     uf,
     *,
-    source_kind: str = "upload",
+    source_kind: str = "mic",
     file_name_override: Optional[str] = None,
-    temp_prefix: str = "stt_ceo_upload_",
+    temp_prefix: str = "stt_ceo_mic_",
 ) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
     file_name = Path(file_name_override or getattr(uf, "name", "") or "uploaded_audio").name
@@ -192,33 +152,6 @@ def _cleanup_temp_uploads(files) -> None:
                 pass
 
 
-def _open_modal_for_upload(uploaded_files) -> None:
-    state = _ensure_state()
-    current = state.get("pending") or {}
-    if current.get("source") == "upload":
-        _cleanup_temp_uploads(current.get("files"))
-    files = [_persist_uploaded_file(uf) for uf in uploaded_files]
-    state["pending"] = {"source": "upload", "files": files}
-
-
-def _open_modal_for_scan(entries: list[CeoSourceFileEntry]) -> None:
-    state = _ensure_state()
-    files = []
-    for e in entries:
-        files.append(
-            {
-                "source_kind": "scan",
-                "file_path": e.file_path,
-                "temp_file_path": None,
-                "file_name": e.file_name,
-                "size_bytes": e.size_bytes,
-                "modified_at": e.modified_at,
-                "source_file_hash": None,
-            }
-        )
-    state["pending"] = {"source": "scan", "files": files}
-
-
 def _process_ceo_entries(
     files: list[dict],
     *,
@@ -247,42 +180,25 @@ def _process_ceo_entries(
             or datetime.now().isoformat(timespec="seconds")
         )
 
-        if f["source_kind"] == "scan":
-            logger.info(
-                "CEO 処理開始 (scan): path=%s size=%s mtime=%s",
-                f["file_path"], f["size_bytes"], f["modified_at"],
-            )
-            result = process_ceo_path(
-                file_path=f["file_path"],
-                title=per_title,
-                speaker=speaker,
-                recorded_at=effective_recorded_at,
-                source_file_size_bytes=f["size_bytes"],
-                source_file_modified_at=f["modified_at"],
-                selected_model=selected_model,
-                use_vad=use_vad,
-                vad_aggressiveness=vad_aggressiveness,
-            )
-        else:
-            logger.info(
-                "CEO 処理開始 (%s): name=%s size=%s hash=%s",
-                f["source_kind"], f["file_name"], f["size_bytes"], f.get("source_file_hash"),
-            )
-            result = process_ceo_uploaded_path(
-                file_name=f["file_name"],
-                temp_file_path=f["temp_file_path"],
-                title=per_title,
-                speaker=speaker,
-                recorded_at=effective_recorded_at,
-                source_file_size_bytes=f["size_bytes"],
-                source_file_modified_at=f.get("modified_at"),
-                source_file_hash=f.get("source_file_hash"),
-                selected_model=selected_model,
-                use_vad=use_vad,
-                vad_aggressiveness=vad_aggressiveness,
-                cleanup_source=True,
-                source_kind=f["source_kind"],
-            )
+        logger.info(
+            "CEO 処理開始 (%s): name=%s size=%s hash=%s",
+            f["source_kind"], f["file_name"], f["size_bytes"], f.get("source_file_hash"),
+        )
+        result = process_ceo_uploaded_path(
+            file_name=f["file_name"],
+            temp_file_path=f["temp_file_path"],
+            title=per_title,
+            speaker=speaker,
+            recorded_at=effective_recorded_at,
+            source_file_size_bytes=f["size_bytes"],
+            source_file_modified_at=f.get("modified_at"),
+            source_file_hash=f.get("source_file_hash"),
+            selected_model=selected_model,
+            use_vad=use_vad,
+            vad_aggressiveness=vad_aggressiveness,
+            cleanup_source=True,
+            source_kind=f["source_kind"],
+        )
         summary.results.append(result)
         progress.progress((idx + 1) / total)
 
@@ -292,148 +208,7 @@ def _process_ceo_entries(
     return summary
 
 
-# ---------- modal ----------
-
-@st.dialog("メタ情報入力", width="large")
-def _meta_input_modal(*, selected_model: str, logger) -> None:
-    state = _ensure_state()
-    pending = state.get("pending")
-    if not pending:
-        st.warning("対象ファイルがありません。")
-        return
-
-    is_scan = pending["source"] == "scan"
-    st.subheader("自動検出ファイルの取り込み設定" if is_scan else "音声ファイルを選択")
-
-    # upload モードの場合、モーダル内にファイル選択UIを出す
-    if not is_scan:
-        uploader_key = f"ceo_modal_uploader_{state['uploader_key']}"
-        uploaded = st.file_uploader(
-            "音声ファイルを選択",
-            type=["wav", "mp3", "m4a", "flac", "ogg", "webm", "aac"],
-            accept_multiple_files=True,
-            key=uploader_key,
-            label_visibility="collapsed",
-        )
-        if uploaded:
-            # rerun のたびに pending["files"] を再構成するが、音声bytesは
-            # session_stateに保持せず、一時ファイルのパスだけを残す。
-            _cleanup_temp_uploads(pending.get("files"))
-            pending["files"] = [_persist_uploaded_file(uf) for uf in uploaded]
-
-    st.caption(f"対象ファイル数: {len(pending.get('files', []))} 件")
-
-    title_input = st.text_input(
-        "タイトル（空欄なら各ファイル名を使用）",
-        value="",
-        key="ceo_modal_title",
-    )
-    speaker_input = st.text_input(
-        "話者",
-        value=DEFAULT_CEO_SPEAKER,
-        key="ceo_modal_speaker",
-    )
-    recorded_at_input = st.text_input(
-        "録音日時（ISO 8601, 例: 2026-05-17T10:00:00。空欄ならファイル更新日時 → 現在時刻）",
-        value="",
-        key="ceo_modal_recorded_at",
-    )
-
-    if pending.get("files"):
-        with st.expander(f"対象ファイル一覧（{len(pending['files'])}件）", expanded=False):
-            for f in pending["files"][:50]:
-                st.write(f"- {f['file_name']} ({(f['size_bytes'] or 0)/1024:.1f} KB)")
-            if len(pending["files"]) > 50:
-                st.caption(f"…ほか {len(pending['files']) - 50} 件")
-
-    col_cancel, col_go = st.columns([1, 1])
-    with col_cancel:
-        if st.button("キャンセル", use_container_width=True, key="ceo_modal_cancel"):
-            _cleanup_temp_uploads(pending.get("files"))
-            state["pending"] = None
-            st.rerun()
-    with col_go:
-        go_disabled = not pending.get("files")
-        if st.button(
-            "🚀 取り込み開始",
-            use_container_width=True,
-            type="primary",
-            disabled=go_disabled,
-            key="ceo_modal_go",
-        ):
-            speaker = (speaker_input or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
-            title_override = title_input.strip()
-            recorded_at_override = recorded_at_input.strip() or None
-
-            try:
-                summary = _process_ceo_entries(
-                    pending["files"],
-                    title_override=title_override,
-                    speaker=speaker,
-                    recorded_at_override=recorded_at_override,
-                    selected_model=selected_model,
-                    logger=logger,
-                )
-            finally:
-                _cleanup_temp_uploads(pending.get("files"))
-
-            state["last_summary"] = summary
-            state["active_idx"] = 0
-            state["pending"] = None
-            if pending["source"] == "upload":
-                state["uploader_key"] += 1
-            st.rerun()
-
-
-# ---------- scan result rendering ----------
-
-def _render_file_list(title: str, files: list[CeoSourceFileEntry], empty_label: str) -> None:
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown(f"**{title}**")
-        with c2:
-            st.caption(f"{len(files)} 件")
-        if not files:
-            st.caption(empty_label)
-            return
-        for f in files[:8]:
-            file_path = _html_text(f.file_path)
-            file_name = _html_text(f.file_name)
-            modified_at = _html_text(
-                _format_datetime(f.modified_at) if f.modified_at else "更新日時なし"
-            )
-            st.markdown(
-                f"<div style='font-size:12px;'>"
-                f"<div style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='{file_path}'>{file_name}</div>"
-                f"<div style='color:#777;'>{modified_at}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        if len(files) > 8:
-            st.caption(f"ほか {len(files) - 8} 件")
-
-
-def _render_scan_summary(scan: CeoScanResult) -> None:
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            st.markdown("### 最新スキャン結果")
-            st.caption(f"対象: {scan.directory_path}")
-        with c2:
-            st.caption(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        cols = st.columns(4)
-        with cols[0]:
-            _render_file_list("今回取り込み対象", scan.queued, "新規の未処理ファイルはありません。")
-        with cols[1]:
-            _render_file_list("既処理", scan.already_processed, "処理済みファイルはありません。")
-        with cols[2]:
-            _render_file_list("既にキュー済み", [], "キュー済みの重複ファイルはありません。")
-        with cols[3]:
-            _render_file_list("VAD生成物として除外", scan.skipped_generated, "除外された VAD ファイルはありません。")
-
-
-# ---------- queue (一括アップロード / 順次処理) ----------
+# ---------- queue (マイク録音 / 処理履歴) ----------
 
 _STATUS_BADGE = {
     "ok": ("完了", "#16a34a"),
@@ -443,11 +218,9 @@ _STATUS_BADGE = {
 
 
 def _source_label(source_kind: str) -> str:
-    if source_kind == "scan":
-        return "自動検出"
     if source_kind == "mic":
         return "マイク録音"
-    return "アップロード"
+    return "社長音声"
 
 
 def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
@@ -475,7 +248,7 @@ def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
     with st.container(border=True):
         c1, c2 = st.columns([3, 4])
         with c1:
-            st.markdown("### 一括アップロード / 順次処理")
+            st.markdown("### マイク録音 / 処理履歴")
         with c2:
             st.markdown(
                 f"<div style='text-align:right;font-size:12px;color:#555;'>"
@@ -483,9 +256,9 @@ def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        st.caption("ファイル数に上限はありません。1件ずつ順番に処理します。")
+        st.caption("録音ごとに1件ずつ処理します。")
         if not rows:
-            st.caption("まだ処理中のファイルはありません。")
+            st.caption("まだ処理した録音はありません。")
             return
         # シンプルなテーブル風表示
         st.markdown(
@@ -709,75 +482,14 @@ def _render_mic_recorder(selected_model: str, logger) -> None:
 
 def run_ceo_tab(selected_model: str, logger) -> None:
     st.header("社長音声")
-    st.caption(
-        "マイク録音、参照フォルダの自動検出、手動アップロードから社長音声を VAD 後に順次文字起こしします。"
-    )
+    st.caption("ブラウザのマイク録音を、社長音声として VAD 後に文字起こしします。")
 
     state = _ensure_state()
-    source_dir = _ceo_source_dir()
 
     _render_mic_recorder(selected_model or DEFAULT_CEO_MODEL, logger)
 
-    # ----- 参照フォルダ表示 -----
-    if source_dir:
-        escaped_source_dir = _html_text(source_dir)
-        st.markdown(
-            f"<div style='font-size:12px;color:#444;margin-top:-4px;'><b>参照フォルダ:</b> {escaped_source_dir}</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div style='font-size:12px;color:#8a6700;margin-top:-4px;'><b>参照フォルダ:</b> 未設定（サイドバーの『🎤 社長音声』で指定してください）</div>",
-            unsafe_allow_html=True,
-        )
-
-    # ----- アクション行 -----
-    col_scan, col_upload, _ = st.columns([1, 1, 3])
-
-    with col_scan:
-        if st.button(
-            "未処理を自動取り込み",
-            use_container_width=True,
-            disabled=not source_dir,
-            help="設定した参照フォルダから未処理音声を自動検出します",
-            key="ceo_tab_scan",
-        ):
-            try:
-                scan = scan_ceo_source_directory(source_dir)
-                state["last_scan"] = scan
-                if scan.queued:
-                    _open_modal_for_scan(scan.queued)
-                    st.rerun()
-                else:
-                    st.info("未処理の音声はありませんでした。")
-            except Exception as exc:
-                st.error(f"スキャンに失敗しました: {exc}")
-                logger.exception("CEO scan failed")
-
-    with col_upload:
-        if st.button(
-            "音声ファイルを選択",
-            use_container_width=True,
-            help="複数選択で順次処理します",
-            key="ceo_tab_open_upload_modal",
-        ):
-            state["pending"] = {"source": "upload", "files": []}
-            state["uploader_key"] += 1
-            st.rerun()
-
-    # ----- スキャン結果（スキャン後のみ）-----
-    if state.get("last_scan") is not None:
-        _render_scan_summary(state["last_scan"])
-
-    # ----- 一括アップロード / 順次処理（常時表示）-----
+    # ----- マイク録音 / 処理履歴（常時表示）-----
     _render_queue(state.get("last_summary"))
 
     # ----- 処理結果（常時表示）-----
     _render_result_panel(state.get("last_summary"), state.get("active_idx", 0))
-
-    # ----- メタ情報モーダル -----
-    if state.get("pending"):
-        _meta_input_modal(
-            selected_model=selected_model or DEFAULT_CEO_MODEL,
-            logger=logger,
-        )
