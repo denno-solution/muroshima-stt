@@ -91,7 +91,7 @@ def _html_text(value) -> str:
 
 # ---------- pending payload structure ----------
 # pending = {
-#   "source": "upload" | "scan",
+#   "source": "upload" | "scan" | "mic",
 #   "files": [
 #       {
 #         source_kind, file_path|None, temp_file_path|None, file_name,
@@ -108,9 +108,31 @@ def _ceo_vad_settings() -> tuple[bool, int]:
     return use_vad, vad_aggr
 
 
-def _persist_uploaded_file(uf) -> dict:
-    temp_dir = Path(tempfile.mkdtemp(prefix="stt_ceo_upload_"))
-    file_name = Path(uf.name).name or "uploaded_audio"
+def _suffix_from_audio_upload(uf, default: str = ".webm") -> str:
+    name_suffix = Path(getattr(uf, "name", "") or "").suffix
+    if name_suffix:
+        return name_suffix
+    content_type = (getattr(uf, "type", "") or "").lower()
+    if "wav" in content_type:
+        return ".wav"
+    if "webm" in content_type:
+        return ".webm"
+    if "mpeg" in content_type or "mp3" in content_type:
+        return ".mp3"
+    if "ogg" in content_type:
+        return ".ogg"
+    return default
+
+
+def _persist_uploaded_file(
+    uf,
+    *,
+    source_kind: str = "upload",
+    file_name_override: Optional[str] = None,
+    temp_prefix: str = "stt_ceo_upload_",
+) -> dict:
+    temp_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
+    file_name = Path(file_name_override or getattr(uf, "name", "") or "uploaded_audio").name
     suffix = Path(file_name).suffix or ".audio"
     temp_path = temp_dir / f"source{suffix}"
     digest = sha256()
@@ -128,7 +150,7 @@ def _persist_uploaded_file(uf) -> dict:
             out.write(chunk)
 
     return {
-        "source_kind": "upload",
+        "source_kind": source_kind,
         "file_path": None,
         "temp_file_path": str(temp_path),
         "temp_dir": str(temp_dir),
@@ -137,6 +159,21 @@ def _persist_uploaded_file(uf) -> dict:
         "modified_at": None,
         "source_file_hash": digest.hexdigest(),
     }
+
+
+def _persist_mic_recording(audio_value) -> dict:
+    timestamp = datetime.now()
+    suffix = _suffix_from_audio_upload(audio_value)
+    file_name = f"ceo_mic_{timestamp.strftime('%Y%m%d_%H%M%S')}{suffix}"
+    entry = _persist_uploaded_file(
+        audio_value,
+        source_kind="mic",
+        file_name_override=file_name,
+        temp_prefix="stt_ceo_mic_",
+    )
+    entry["modified_at"] = timestamp.isoformat(timespec="seconds")
+    entry["recorded_at"] = timestamp.isoformat(timespec="seconds")
+    return entry
 
 
 def _cleanup_temp_uploads(files) -> None:
@@ -180,6 +217,79 @@ def _open_modal_for_scan(entries: list[CeoSourceFileEntry]) -> None:
             }
         )
     state["pending"] = {"source": "scan", "files": files}
+
+
+def _process_ceo_entries(
+    files: list[dict],
+    *,
+    title_override: str,
+    speaker: str,
+    recorded_at_override: Optional[str],
+    selected_model: str,
+    logger,
+) -> CeoBatchSummary:
+    summary = CeoBatchSummary()
+    progress = st.progress(0.0)
+    status = st.empty()
+    total = len(files)
+    use_vad, vad_aggressiveness = _ceo_vad_settings()
+
+    if total == 0:
+        return summary
+
+    for idx, f in enumerate(files):
+        status.text(f"処理中: {f['file_name']} ({idx + 1}/{total})")
+        per_title = title_override or Path(f["file_name"]).stem
+        effective_recorded_at = (
+            recorded_at_override
+            or f.get("recorded_at")
+            or f.get("modified_at")
+            or datetime.now().isoformat(timespec="seconds")
+        )
+
+        if f["source_kind"] == "scan":
+            logger.info(
+                "CEO 処理開始 (scan): path=%s size=%s mtime=%s",
+                f["file_path"], f["size_bytes"], f["modified_at"],
+            )
+            result = process_ceo_path(
+                file_path=f["file_path"],
+                title=per_title,
+                speaker=speaker,
+                recorded_at=effective_recorded_at,
+                source_file_size_bytes=f["size_bytes"],
+                source_file_modified_at=f["modified_at"],
+                selected_model=selected_model,
+                use_vad=use_vad,
+                vad_aggressiveness=vad_aggressiveness,
+            )
+        else:
+            logger.info(
+                "CEO 処理開始 (%s): name=%s size=%s hash=%s",
+                f["source_kind"], f["file_name"], f["size_bytes"], f.get("source_file_hash"),
+            )
+            result = process_ceo_uploaded_path(
+                file_name=f["file_name"],
+                temp_file_path=f["temp_file_path"],
+                title=per_title,
+                speaker=speaker,
+                recorded_at=effective_recorded_at,
+                source_file_size_bytes=f["size_bytes"],
+                source_file_modified_at=f.get("modified_at"),
+                source_file_hash=f.get("source_file_hash"),
+                selected_model=selected_model,
+                use_vad=use_vad,
+                vad_aggressiveness=vad_aggressiveness,
+                cleanup_source=True,
+                source_kind=f["source_kind"],
+            )
+        summary.results.append(result)
+        progress.progress((idx + 1) / total)
+
+    status.text(
+        f"完了: 成功 {summary.ok_count} / 重複スキップ {summary.skipped_count} / 失敗 {summary.error_count}"
+    )
+    return summary
 
 
 # ---------- modal ----------
@@ -255,63 +365,17 @@ def _meta_input_modal(*, selected_model: str, logger) -> None:
             title_override = title_input.strip()
             recorded_at_override = recorded_at_input.strip() or None
 
-            summary = CeoBatchSummary()
-            progress = st.progress(0.0)
-            status = st.empty()
-            total = len(pending["files"])
-            use_vad, vad_aggressiveness = _ceo_vad_settings()
-
             try:
-                for idx, f in enumerate(pending["files"]):
-                    status.text(f"処理中: {f['file_name']} ({idx + 1}/{total})")
-                    per_title = title_override or Path(f["file_name"]).stem
-                    effective_recorded_at = (
-                        recorded_at_override or f.get("modified_at") or datetime.now().isoformat(timespec="seconds")
-                    )
-
-                    if f["source_kind"] == "scan":
-                        logger.info(
-                            "CEO 処理開始 (scan): path=%s size=%s mtime=%s",
-                            f["file_path"], f["size_bytes"], f["modified_at"],
-                        )
-                        result = process_ceo_path(
-                            file_path=f["file_path"],
-                            title=per_title,
-                            speaker=speaker,
-                            recorded_at=effective_recorded_at,
-                            source_file_size_bytes=f["size_bytes"],
-                            source_file_modified_at=f["modified_at"],
-                            selected_model=selected_model,
-                            use_vad=use_vad,
-                            vad_aggressiveness=vad_aggressiveness,
-                        )
-                    else:
-                        logger.info(
-                            "CEO 処理開始 (upload): name=%s size=%s hash=%s",
-                            f["file_name"], f["size_bytes"], f.get("source_file_hash"),
-                        )
-                        result = process_ceo_uploaded_path(
-                            file_name=f["file_name"],
-                            temp_file_path=f["temp_file_path"],
-                            title=per_title,
-                            speaker=speaker,
-                            recorded_at=effective_recorded_at,
-                            source_file_size_bytes=f["size_bytes"],
-                            source_file_modified_at=f.get("modified_at"),
-                            source_file_hash=f.get("source_file_hash"),
-                            selected_model=selected_model,
-                            use_vad=use_vad,
-                            vad_aggressiveness=vad_aggressiveness,
-                            cleanup_source=True,
-                        )
-                    summary.results.append(result)
-                    progress.progress((idx + 1) / total)
+                summary = _process_ceo_entries(
+                    pending["files"],
+                    title_override=title_override,
+                    speaker=speaker,
+                    recorded_at_override=recorded_at_override,
+                    selected_model=selected_model,
+                    logger=logger,
+                )
             finally:
                 _cleanup_temp_uploads(pending.get("files"))
-
-            status.text(
-                f"完了: 成功 {summary.ok_count} / 重複スキップ {summary.skipped_count} / 失敗 {summary.error_count}"
-            )
 
             state["last_summary"] = summary
             state["active_idx"] = 0
@@ -378,6 +442,14 @@ _STATUS_BADGE = {
 }
 
 
+def _source_label(source_kind: str) -> str:
+    if source_kind == "scan":
+        return "自動検出"
+    if source_kind == "mic":
+        return "マイク録音"
+    return "アップロード"
+
+
 def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
     """desktop の RecorderUploadQueue 相当。Streamlit は同期実行のため
     「処理中 / 待機」は常に 0 として表示し、完了後の集計のみ反映する。
@@ -388,7 +460,7 @@ def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
     if summary and summary.results:
         for r in summary.results:
             label, _ = _STATUS_BADGE.get(r.status, ("-", "#6b7280"))
-            source = "自動検出" if r.source_kind == "scan" else "アップロード"
+            source = _source_label(r.source_kind)
             memo = ""
             if r.status == "error":
                 memo = r.error or "処理に失敗しました"
@@ -538,16 +610,113 @@ def _render_result_panel(summary: Optional[CeoBatchSummary], active_idx: int) ->
         )
 
 
+def _audio_value_digest(audio_value) -> Optional[str]:
+    try:
+        raw = audio_value.getvalue() if hasattr(audio_value, "getvalue") else audio_value
+        return sha256(raw).hexdigest()
+    except Exception:
+        return None
+
+
+def _render_mic_recorder(selected_model: str, logger) -> None:
+    state = _ensure_state()
+
+    with st.container(border=True):
+        st.markdown("### マイクで録音して取り込み")
+        st.caption("ブラウザのマイクで録音した音声を、社長音声として ceo_transcriptions に保存します。")
+
+        col_title, col_speaker, col_time = st.columns([2, 1, 2])
+        with col_title:
+            title_input = st.text_input(
+                "タイトル（空欄なら録音ファイル名を使用）",
+                value="",
+                key="ceo_mic_title",
+            )
+        with col_speaker:
+            speaker_input = st.text_input(
+                "話者",
+                value=DEFAULT_CEO_SPEAKER,
+                key="ceo_mic_speaker",
+            )
+        with col_time:
+            recorded_at_input = st.text_input(
+                "録音日時（空欄なら録音完了時刻）",
+                value="",
+                key="ceo_mic_recorded_at",
+                help="ISO 8601形式で指定できます。例: 2026-05-21T10:00:00",
+            )
+
+        audio_value = st.audio_input(
+            "🎙️ 社長音声を録音してください",
+            help="録音を停止したあと、「社長音声として取り込む」を押してください。",
+            key="ceo_mic_audio_input",
+        )
+        if not audio_value:
+            return
+
+        st.success("録音完了！")
+        current_digest = _audio_value_digest(audio_value)
+        if current_digest and st.session_state.get("ceo_mic_last_digest") == current_digest:
+            st.caption("この録音は直近で取り込み済みです。再取り込みした場合は重複として扱われます。")
+
+        disabled = bool(st.session_state.get("ceo_mic_processing", False))
+        if not st.button(
+            "社長音声として取り込む",
+            type="primary",
+            use_container_width=True,
+            disabled=disabled,
+            key="ceo_mic_process_button",
+        ):
+            return
+
+        st.session_state.ceo_mic_processing = True
+        files: list[dict] = []
+        try:
+            files = [_persist_mic_recording(audio_value)]
+            speaker = (speaker_input or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
+            title_override = title_input.strip()
+            recorded_at_override = recorded_at_input.strip() or None
+
+            with st.spinner("社長音声として文字起こし中..."):
+                summary = _process_ceo_entries(
+                    files,
+                    title_override=title_override,
+                    speaker=speaker,
+                    recorded_at_override=recorded_at_override,
+                    selected_model=selected_model or DEFAULT_CEO_MODEL,
+                    logger=logger,
+                )
+
+            state["last_summary"] = summary
+            state["active_idx"] = 0
+            if current_digest:
+                st.session_state.ceo_mic_last_digest = current_digest
+            if summary.ok_count:
+                st.success("社長音声として保存しました。")
+            elif summary.skipped_count:
+                st.info("同じ録音が既に保存済みだったため、重複としてスキップしました。")
+            elif summary.error_count:
+                st.error("社長音声の取り込みに失敗しました。詳細は下の処理結果を確認してください。")
+        except Exception as exc:
+            st.error(f"社長音声の取り込みに失敗しました: {exc}")
+            logger.exception("CEO mic recording failed")
+        finally:
+            _cleanup_temp_uploads(files)
+            st.session_state.ceo_mic_processing = False
+
+
 # ---------- main tab ----------
 
 def run_ceo_tab(selected_model: str, logger) -> None:
     st.header("社長音声")
     st.caption(
-        "参照フォルダの未処理音声を自動検出するか、手動で選択した音声を VAD 後に順次文字起こしします。"
+        "マイク録音、参照フォルダの自動検出、手動アップロードから社長音声を VAD 後に順次文字起こしします。"
     )
 
     state = _ensure_state()
     source_dir = _ceo_source_dir()
+
+    _render_mic_recorder(selected_model or DEFAULT_CEO_MODEL, logger)
 
     # ----- 参照フォルダ表示 -----
     if source_dir:
