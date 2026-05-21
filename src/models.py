@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     Boolean,
     create_engine,
+    inspect,
     text,
 )
 from sqlalchemy.engine import make_url
@@ -107,6 +108,7 @@ class CeoTranscription(Base):
     source_file_path = Column(String(500), nullable=True)
     source_file_size_bytes = Column(Integer, nullable=True)
     source_file_modified_at = Column(String(64), nullable=True)
+    source_file_hash = Column(String(64), nullable=True)
     title = Column(String(500), nullable=True)
     speaker = Column(String(200), nullable=True)
     recorded_at = Column(String(64), nullable=True)
@@ -261,6 +263,55 @@ try:
     logger.debug("DB schema check/create completed in %.3fs", _t1 - _t0)
 except Exception:
     pass
+
+
+def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
+    """既存SQLite/libSQLテーブルに不足カラムを追加する。
+
+    SQLAlchemyのcreate_allは既存テーブルを変更しないため、desktop版の
+    ensure_tables相当として互換カラムを明示的に補完する。
+    """
+
+    try:
+        existing = {col["name"] for col in inspect(engine).get_columns(table_name)}
+    except Exception as exc:
+        logger.warning("%s のカラム確認に失敗: %s", table_name, exc)
+        return
+
+    missing = [(name, spec) for name, spec in columns.items() if name not in existing]
+    if not missing:
+        return
+
+    try:
+        with engine.begin() as connection:
+            for name, spec in missing:
+                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {spec}"))
+                logger.info("%s.%s カラムを追加しました", table_name, name)
+    except Exception as exc:
+        logger.warning("%s のカラム追加に失敗: %s", table_name, exc)
+
+
+_ensure_columns(
+    "ceo_transcriptions",
+    {
+        "file_path": "TEXT",
+        "local_file_path": "TEXT",
+        "source_file_path": "TEXT",
+        "source_file_size_bytes": "INTEGER",
+        "source_file_modified_at": "TEXT",
+        "source_file_hash": "TEXT",
+        "title": "TEXT",
+        "speaker": "TEXT",
+        "recorded_at": "TEXT",
+        "model_id": "TEXT",
+        "language_code": "TEXT",
+        "transcript": "TEXT",
+        "structured_json": "TEXT",
+        "duration_seconds": "REAL",
+        "tags": "TEXT",
+        "created_at": "TEXT",
+    },
+)
 
 # セッション作成
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

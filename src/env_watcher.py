@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from pathlib import Path
-from dotenv import load_dotenv, dotenv_values
+from dotenv import load_dotenv
 import hashlib
 
 def get_env_hash():
@@ -44,6 +44,7 @@ def display_env_status(sidebar=True):
         
     with container.expander("🔧 環境変数の設定状況", expanded=False):
         env_vars = {
+            "DATABASE_URL": "Database",
             "OPENAI_API_KEY": "OpenAI",
             "GEMINI_API_KEY": "Gemini",
             "GOOGLE_AI_API_KEY": "Google AI (代替)",
@@ -51,6 +52,7 @@ def display_env_status(sidebar=True):
             "AWS_ACCESS_KEY_ID": "AWS",
             "AZURE_SPEECH_KEY": "Azure",
             "ELEVENLABS_API_KEY": "ElevenLabs",
+            "CEO_SOURCE_DIR": "社長音声 参照フォルダ",
             # Cloudflare R2
             "R2_ACCOUNT_ID": "Cloudflare R2",
             "R2_ACCESS_KEY_ID": "Cloudflare R2",

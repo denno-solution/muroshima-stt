@@ -63,6 +63,7 @@ def _load_records():
                 "source_file_path": record.source_file_path,
                 "source_file_size_bytes": record.source_file_size_bytes,
                 "source_file_modified_at": record.source_file_modified_at,
+                "source_file_hash": record.source_file_hash,
                 "file_path": record.file_path,
                 "local_file_path": record.local_file_path,
                 "model_id": record.model_id,
@@ -177,6 +178,7 @@ def run_ceo_db_tab() -> None:
             st.write(f"**source_file_path:** {record['source_file_path'] or '-'}")
             st.write(f"**source_file_size_bytes:** {record['source_file_size_bytes'] or '-'}")
             st.write(f"**source_file_modified_at:** {record['source_file_modified_at'] or '-'}")
+            st.write(f"**source_file_hash:** {record['source_file_hash'] or '-'}")
             st.write(f"**file_path:** {record['file_path'] or '-'}")
             st.write(f"**local_file_path:** {record['local_file_path'] or '-'}")
 

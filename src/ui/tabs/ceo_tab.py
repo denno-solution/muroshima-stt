@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import html
 import os
+import tempfile
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
@@ -26,15 +28,14 @@ from services.ceo_processor import (
     CeoProcessResult,
     CeoScanResult,
     CeoSourceFileEntry,
-    process_ceo_file,
     process_ceo_path,
+    process_ceo_uploaded_path,
     scan_ceo_source_directory,
 )
 
 
-# desktop の CeoView と一致させる（threshold は固定、常時 ON）
-CEO_VAD_ENABLED = True
-CEO_VAD_AGGRESSIVENESS = 2  # webrtcvad 用近似値（desktop の WebAudio 独自閾値 0.005 と等価ではない）
+DEFAULT_CEO_VAD_ENABLED = True
+DEFAULT_CEO_VAD_AGGRESSIVENESS = 2
 
 
 # ---------- state helpers ----------
@@ -91,24 +92,75 @@ def _html_text(value) -> str:
 # ---------- pending payload structure ----------
 # pending = {
 #   "source": "upload" | "scan",
-#   "files": [ {source_kind, file_path|None, file_name, size_bytes, modified_at|None, bytes|None}, ... ],
+#   "files": [
+#       {
+#         source_kind, file_path|None, temp_file_path|None, file_name,
+#         size_bytes, modified_at|None, source_file_hash|None
+#       }, ...
+#   ],
 # }
+
+
+def _ceo_vad_settings() -> tuple[bool, int]:
+    app_settings = st.session_state.get("settings")
+    use_vad = bool(getattr(app_settings, "get_use_vad", lambda: DEFAULT_CEO_VAD_ENABLED)())
+    vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: DEFAULT_CEO_VAD_AGGRESSIVENESS)())
+    return use_vad, vad_aggr
+
+
+def _persist_uploaded_file(uf) -> dict:
+    temp_dir = Path(tempfile.mkdtemp(prefix="stt_ceo_upload_"))
+    file_name = Path(uf.name).name or "uploaded_audio"
+    suffix = Path(file_name).suffix or ".audio"
+    temp_path = temp_dir / f"source{suffix}"
+    digest = sha256()
+    size = 0
+
+    if hasattr(uf, "seek"):
+        uf.seek(0)
+    with open(temp_path, "wb") as out:
+        while True:
+            chunk = uf.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            out.write(chunk)
+
+    return {
+        "source_kind": "upload",
+        "file_path": None,
+        "temp_file_path": str(temp_path),
+        "temp_dir": str(temp_dir),
+        "file_name": file_name,
+        "size_bytes": size,
+        "modified_at": None,
+        "source_file_hash": digest.hexdigest(),
+    }
+
+
+def _cleanup_temp_uploads(files) -> None:
+    for f in files or []:
+        temp_path = f.get("temp_file_path")
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        temp_dir = f.get("temp_dir")
+        if temp_dir:
+            try:
+                Path(temp_dir).rmdir()
+            except Exception:
+                pass
 
 
 def _open_modal_for_upload(uploaded_files) -> None:
     state = _ensure_state()
-    files = []
-    for uf in uploaded_files:
-        files.append(
-            {
-                "source_kind": "upload",
-                "file_path": None,
-                "file_name": uf.name,
-                "size_bytes": int(uf.size) if uf.size is not None else None,
-                "modified_at": None,
-                "bytes": uf.getvalue() if hasattr(uf, "getvalue") else uf.read(),
-            }
-        )
+    current = state.get("pending") or {}
+    if current.get("source") == "upload":
+        _cleanup_temp_uploads(current.get("files"))
+    files = [_persist_uploaded_file(uf) for uf in uploaded_files]
     state["pending"] = {"source": "upload", "files": files}
 
 
@@ -120,10 +172,11 @@ def _open_modal_for_scan(entries: list[CeoSourceFileEntry]) -> None:
             {
                 "source_kind": "scan",
                 "file_path": e.file_path,
+                "temp_file_path": None,
                 "file_name": e.file_name,
                 "size_bytes": e.size_bytes,
                 "modified_at": e.modified_at,
-                "bytes": None,
+                "source_file_hash": None,
             }
         )
     state["pending"] = {"source": "scan", "files": files}
@@ -153,20 +206,10 @@ def _meta_input_modal(*, selected_model: str, logger) -> None:
             label_visibility="collapsed",
         )
         if uploaded:
-            # rerun のたびに pending["files"] を再構成
-            files = []
-            for uf in uploaded:
-                files.append(
-                    {
-                        "source_kind": "upload",
-                        "file_path": None,
-                        "file_name": uf.name,
-                        "size_bytes": int(uf.size) if uf.size is not None else None,
-                        "modified_at": None,
-                        "bytes": uf.getvalue() if hasattr(uf, "getvalue") else uf.read(),
-                    }
-                )
-            pending["files"] = files
+            # rerun のたびに pending["files"] を再構成するが、音声bytesは
+            # session_stateに保持せず、一時ファイルのパスだけを残す。
+            _cleanup_temp_uploads(pending.get("files"))
+            pending["files"] = [_persist_uploaded_file(uf) for uf in uploaded]
 
     st.caption(f"対象ファイル数: {len(pending.get('files', []))} 件")
 
@@ -196,6 +239,7 @@ def _meta_input_modal(*, selected_model: str, logger) -> None:
     col_cancel, col_go = st.columns([1, 1])
     with col_cancel:
         if st.button("キャンセル", use_container_width=True, key="ceo_modal_cancel"):
+            _cleanup_temp_uploads(pending.get("files"))
             state["pending"] = None
             st.rerun()
     with col_go:
@@ -215,48 +259,55 @@ def _meta_input_modal(*, selected_model: str, logger) -> None:
             progress = st.progress(0.0)
             status = st.empty()
             total = len(pending["files"])
+            use_vad, vad_aggressiveness = _ceo_vad_settings()
 
-            for idx, f in enumerate(pending["files"]):
-                status.text(f"処理中: {f['file_name']} ({idx + 1}/{total})")
-                per_title = title_override or Path(f["file_name"]).stem
-                effective_recorded_at = (
-                    recorded_at_override or f.get("modified_at") or datetime.now().isoformat(timespec="seconds")
-                )
+            try:
+                for idx, f in enumerate(pending["files"]):
+                    status.text(f"処理中: {f['file_name']} ({idx + 1}/{total})")
+                    per_title = title_override or Path(f["file_name"]).stem
+                    effective_recorded_at = (
+                        recorded_at_override or f.get("modified_at") or datetime.now().isoformat(timespec="seconds")
+                    )
 
-                if f["source_kind"] == "scan":
-                    logger.info(
-                        "CEO 処理開始 (scan): path=%s size=%s mtime=%s",
-                        f["file_path"], f["size_bytes"], f["modified_at"],
-                    )
-                    result = process_ceo_path(
-                        file_path=f["file_path"],
-                        title=per_title,
-                        speaker=speaker,
-                        recorded_at=effective_recorded_at,
-                        source_file_size_bytes=f["size_bytes"],
-                        source_file_modified_at=f["modified_at"],
-                        selected_model=selected_model,
-                        use_vad=CEO_VAD_ENABLED,
-                        vad_aggressiveness=CEO_VAD_AGGRESSIVENESS,
-                    )
-                else:
-                    logger.info(
-                        "CEO 処理開始 (upload): name=%s size=%s",
-                        f["file_name"], f["size_bytes"],
-                    )
-                    result = process_ceo_file(
-                        file_name=f["file_name"],
-                        file_bytes=f["bytes"],
-                        title=per_title,
-                        speaker=speaker,
-                        recorded_at=effective_recorded_at,
-                        source_file_modified_at=f.get("modified_at"),
-                        selected_model=selected_model,
-                        use_vad=CEO_VAD_ENABLED,
-                        vad_aggressiveness=CEO_VAD_AGGRESSIVENESS,
-                    )
-                summary.results.append(result)
-                progress.progress((idx + 1) / total)
+                    if f["source_kind"] == "scan":
+                        logger.info(
+                            "CEO 処理開始 (scan): path=%s size=%s mtime=%s",
+                            f["file_path"], f["size_bytes"], f["modified_at"],
+                        )
+                        result = process_ceo_path(
+                            file_path=f["file_path"],
+                            title=per_title,
+                            speaker=speaker,
+                            recorded_at=effective_recorded_at,
+                            source_file_size_bytes=f["size_bytes"],
+                            source_file_modified_at=f["modified_at"],
+                            selected_model=selected_model,
+                            use_vad=use_vad,
+                            vad_aggressiveness=vad_aggressiveness,
+                        )
+                    else:
+                        logger.info(
+                            "CEO 処理開始 (upload): name=%s size=%s hash=%s",
+                            f["file_name"], f["size_bytes"], f.get("source_file_hash"),
+                        )
+                        result = process_ceo_uploaded_path(
+                            file_name=f["file_name"],
+                            temp_file_path=f["temp_file_path"],
+                            title=per_title,
+                            speaker=speaker,
+                            recorded_at=effective_recorded_at,
+                            source_file_size_bytes=f["size_bytes"],
+                            source_file_modified_at=f.get("modified_at"),
+                            source_file_hash=f.get("source_file_hash"),
+                            selected_model=selected_model,
+                            use_vad=use_vad,
+                            vad_aggressiveness=vad_aggressiveness,
+                            cleanup_source=True,
+                        )
+                    summary.results.append(result)
+                    progress.progress((idx + 1) / total)
+            finally:
+                _cleanup_temp_uploads(pending.get("files"))
 
             status.text(
                 f"完了: 成功 {summary.ok_count} / 重複スキップ {summary.skipped_count} / 失敗 {summary.error_count}"
@@ -390,8 +441,8 @@ def _render_queue(summary: Optional[CeoBatchSummary]) -> None:
 
 
 def _status_key_from_label(label: str) -> str:
-    for k, (l, _) in _STATUS_BADGE.items():
-        if l == label:
+    for k, (status_label, _) in _STATUS_BADGE.items():
+        if status_label == label:
             return k
     return "ok"
 
