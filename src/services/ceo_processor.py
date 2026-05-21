@@ -68,7 +68,7 @@ class CeoProcessResult:
 
     file_name: str
     status: str  # "ok" | "skipped_duplicate" | "error"
-    source_kind: str = "upload"  # "upload" | "scan"
+    source_kind: str = "upload"  # "upload" | "scan" | "mic"
     record_id: Optional[int] = None
     transcript: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -111,8 +111,13 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _browser_source_key(source_kind: str, file_name: str, source_file_hash: str) -> str:
+    prefix = "mic" if source_kind == "mic" else "upload"
+    return f"{prefix}:{source_file_hash}:{Path(file_name).name}"
+
+
 def _upload_source_key(file_name: str, source_file_hash: str) -> str:
-    return f"upload:{source_file_hash}:{Path(file_name).name}"
+    return _browser_source_key("upload", file_name, source_file_hash)
 
 
 def _append_warning(result: CeoProcessResult, message: str) -> None:
@@ -682,6 +687,7 @@ def process_ceo_uploaded_path(
     use_vad: bool = True,
     vad_aggressiveness: int = 2,
     cleanup_source: bool = False,
+    source_kind: str = "upload",
 ) -> CeoProcessResult:
     """アップロード済み一時ファイルを処理して `ceo_transcriptions` に保存する。
 
@@ -698,7 +704,8 @@ def process_ceo_uploaded_path(
             source_file_size_bytes = None
     if source_file_hash is None:
         source_file_hash = _sha256_file(str(src))
-    source_file_path = _upload_source_key(file_name, source_file_hash)
+    normalized_source_kind = "mic" if source_kind == "mic" else "upload"
+    source_file_path = _browser_source_key(normalized_source_kind, file_name, source_file_hash)
 
     title = (title or Path(file_name).stem or "社長音声").strip()
     speaker = (speaker or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
@@ -707,7 +714,7 @@ def process_ceo_uploaded_path(
     result = CeoProcessResult(
         file_name=file_name,
         status="error",
-        source_kind="upload",
+        source_kind=normalized_source_kind,
         title=title,
         speaker=speaker,
         recorded_at=recorded_at,
