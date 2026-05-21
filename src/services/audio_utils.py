@@ -40,3 +40,16 @@ def get_audio_duration(src_path: str, target_sr: int = 16000) -> float:
         return len(audio_data) / sr
     except Exception:
         return 0.0
+
+
+def get_audio_duration_metadata(src_path: str) -> float:
+    """Return duration from container metadata without decoding the whole file."""
+
+    try:
+        info = sf.info(src_path)
+        return float(info.duration or 0.0)
+    except Exception:
+        try:
+            return float(librosa.get_duration(path=src_path))
+        except Exception:
+            return 0.0
