@@ -197,7 +197,6 @@ def _process_ceo_entries(
             use_vad=use_vad,
             vad_aggressiveness=vad_aggressiveness,
             cleanup_source=True,
-            source_kind=f["source_kind"],
         )
         summary.results.append(result)
         progress.progress((idx + 1) / total)
