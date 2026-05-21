@@ -52,7 +52,6 @@ def display_env_status(sidebar=True):
             "AWS_ACCESS_KEY_ID": "AWS",
             "AZURE_SPEECH_KEY": "Azure",
             "ELEVENLABS_API_KEY": "ElevenLabs",
-            "CEO_SOURCE_DIR": "社長音声 参照フォルダ",
             # Cloudflare R2
             "R2_ACCOUNT_ID": "Cloudflare R2",
             "R2_ACCESS_KEY_ID": "Cloudflare R2",
