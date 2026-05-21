@@ -1,12 +1,11 @@
 """社長音声（CEO）処理サービス。
 
-stt-desktop の `process_ceo_recording` / `scan_ceo_source_directory` 相当の処理を
-Streamlit Web 版向けに移植したもの。
+stt-desktop の `process_ceo_recording` 相当の処理を Streamlit Web 版向けに移植したもの。
 
 - VAD で非音声区間をカット（既存 services.vad を流用）
 - 任意の STT モデル（既定 ElevenLabs）で文字起こし
 - `ceo_transcriptions` テーブルに保存
-- 同じ source（path + size + modified_at / upload hash）が既に登録済みなら重複としてスキップ
+- 同じ source（録音ファイルhash）が既に登録済みなら重複としてスキップ
 
 stt-desktop と同じ DATABASE_URL を共有すれば、両アプリで `ceo_transcriptions` を
 透過的に共有できる。
@@ -17,9 +16,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Optional
@@ -37,29 +35,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CEO_MODEL = "ElevenLabs"
 DEFAULT_CEO_SPEAKER = "社長"
-SUPPORTED_AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac", ".aac")
 DEFAULT_CEO_VAD_MAX_BYTES = 200 * 1024 * 1024
 DEFAULT_CEO_VAD_MAX_DURATION_SECONDS = 60 * 60
-
-
-@dataclass
-class CeoSourceFileEntry:
-    """参照フォルダのスキャンで見つかった音声ファイル1件分。"""
-
-    file_path: str
-    file_name: str
-    size_bytes: int
-    modified_at: Optional[str]
-
-
-@dataclass
-class CeoScanResult:
-    """`scan_ceo_source_directory` の結果。stt-desktop と同じ4分類。"""
-
-    directory_path: str
-    queued: list = field(default_factory=list)
-    already_processed: list = field(default_factory=list)
-    skipped_generated: list = field(default_factory=list)
 
 
 @dataclass
@@ -68,7 +45,7 @@ class CeoProcessResult:
 
     file_name: str
     status: str  # "ok" | "skipped_duplicate" | "error"
-    source_kind: str = "upload"  # "upload" | "scan" | "mic"
+    source_kind: str = "mic"
     record_id: Optional[int] = None
     transcript: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -111,13 +88,8 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _browser_source_key(source_kind: str, file_name: str, source_file_hash: str) -> str:
-    prefix = "mic" if source_kind == "mic" else "upload"
-    return f"{prefix}:{source_file_hash}:{Path(file_name).name}"
-
-
-def _upload_source_key(file_name: str, source_file_hash: str) -> str:
-    return _browser_source_key("upload", file_name, source_file_hash)
+def _mic_source_key(file_name: str, source_file_hash: str) -> str:
+    return f"mic:{source_file_hash}:{Path(file_name).name}"
 
 
 def _append_warning(result: CeoProcessResult, message: str) -> None:
@@ -371,308 +343,6 @@ def _save_vad_output(source_vad_path: str, base_file_name: str) -> str:
     raise RuntimeError("VAD 出力ファイル名を決定できませんでした")
 
 
-def _save_vad_output_next_to_source(source_vad_path: str, original_source_path: str) -> str:
-    """desktop と同じく、参照フォルダ取り込み時は元音声と同じフォルダに `*_vad.wav`
-    を保存する。重複時は `_vad_<n>` で連番。
-    """
-
-    original = Path(original_source_path)
-    out_dir = original.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = _strip_vad_suffix(original.stem) or "ceo"
-    for attempt in range(1000):
-        suffix = "_vad" if attempt == 0 else f"_vad_{attempt}"
-        candidate = out_dir / f"{stem}{suffix}.wav"
-        if not candidate.exists():
-            try:
-                shutil.move(source_vad_path, candidate)
-            except Exception:
-                shutil.copyfile(source_vad_path, candidate)
-                try:
-                    os.unlink(source_vad_path)
-                except OSError:
-                    pass
-            return str(candidate)
-    raise RuntimeError("VAD 出力ファイル名を決定できませんでした")
-
-
-def _system_time_to_iso(ts: float) -> str:
-    """`os.stat().st_mtime` から RFC3339(UTC) を生成。
-    stt-desktop の `system_time_to_rfc3339` と揃える。
-    """
-
-    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
-
-
-def _iter_audio_files(root: Path):
-    """再帰的に音声ファイルを列挙。"""
-
-    for entry in root.rglob("*"):
-        if entry.is_file() and entry.suffix.lower() in SUPPORTED_AUDIO_EXTS:
-            yield entry
-
-
-def scan_ceo_source_directory(directory_path: Optional[str] = None) -> CeoScanResult:
-    """参照フォルダを再帰スキャンして、未処理 / 既処理 / VAD生成物 に分類して返す。
-
-    引数で `directory_path` を渡さない場合は環境変数 `CEO_SOURCE_DIR` を参照。
-    Web 版ではブラウザ側のフォルダにはアクセスできないため、必ずサーバー側パスを指定すること。
-    """
-
-    _require_configured_database()
-    raw_dir = (directory_path or os.getenv("CEO_SOURCE_DIR", "")).strip()
-    if not raw_dir:
-        raise ValueError(
-            "社長音声の参照フォルダが未設定です。環境変数 CEO_SOURCE_DIR にサーバー側パスを設定してください。"
-        )
-    directory = Path(raw_dir)
-    if not directory.exists():
-        raise FileNotFoundError(f"参照フォルダが存在しません: {directory}")
-    if not directory.is_dir():
-        raise NotADirectoryError(f"参照先がフォルダではありません: {directory}")
-
-    # 既処理シグネチャを DB から取得
-    db = next(get_db())
-    try:
-        processed = db.query(CeoTranscription).all()
-        signatures: dict[str, list[CeoTranscription]] = {}
-        legacy_keys: set[str] = set()
-        for r in processed:
-            key = _normalize_path_for_match(r.source_file_path)
-            if not key:
-                for legacy_path in (r.local_file_path, r.file_path):
-                    legacy_key = _canonical_source_key(legacy_path)
-                    if legacy_key:
-                        legacy_keys.add(legacy_key)
-                continue
-            signatures.setdefault(key, []).append(r)
-    finally:
-        db.close()
-
-    result = CeoScanResult(directory_path=str(directory))
-
-    for path in _iter_audio_files(directory):
-        try:
-            stat = path.stat()
-        except OSError as exc:
-            logger.warning("ファイル情報取得に失敗 (%s): %s", path, exc)
-            continue
-        entry = CeoSourceFileEntry(
-            file_path=str(path),
-            file_name=path.name,
-            size_bytes=int(stat.st_size),
-            modified_at=_system_time_to_iso(stat.st_mtime),
-        )
-        if is_generated_vad_file(path.name):
-            result.skipped_generated.append(entry)
-            continue
-
-        normalized_path = _normalize_path_for_match(entry.file_path)
-        sig_candidates = signatures.get(normalized_path or "", [])
-        matched = any(
-            _signature_matches(
-                candidate,
-                size_bytes=entry.size_bytes,
-                modified_at=entry.modified_at,
-            )
-            for candidate in sig_candidates
-        )
-        if not matched:
-            canonical_key = _canonical_source_key(entry.file_path)
-            matched = bool(canonical_key and canonical_key in legacy_keys)
-        if matched:
-            result.already_processed.append(entry)
-        else:
-            result.queued.append(entry)
-
-    def sort_key(e):
-        return (e.modified_at or "", e.file_path)
-
-    result.queued.sort(key=sort_key)
-    result.already_processed.sort(key=sort_key)
-    result.skipped_generated.sort(key=sort_key)
-    return result
-
-
-def process_ceo_path(
-    *,
-    file_path: str,
-    title: Optional[str],
-    speaker: Optional[str],
-    recorded_at: Optional[str],
-    source_file_size_bytes: Optional[int] = None,
-    source_file_modified_at: Optional[str] = None,
-    selected_model: str = DEFAULT_CEO_MODEL,
-    use_vad: bool = True,
-    vad_aggressiveness: int = 2,
-) -> CeoProcessResult:
-    """サーバー上にあるファイルパス指定で処理する。
-
-    参照フォルダ自動取り込み（scan）経由用。desktop と同じく VAD 出力は元音声と
-    同じフォルダに `*_vad.wav` で書き出す。
-    """
-
-    _require_configured_database()
-    src = Path(file_path)
-    file_name = src.name
-    title = (title or src.stem or "社長音声").strip()
-    speaker = (speaker or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
-    recorded_at = (recorded_at or "").strip() or None
-
-    if source_file_size_bytes is None or source_file_modified_at is None:
-        try:
-            stat = src.stat()
-            if source_file_size_bytes is None:
-                source_file_size_bytes = int(stat.st_size)
-            if source_file_modified_at is None:
-                source_file_modified_at = _system_time_to_iso(stat.st_mtime)
-        except OSError:
-            pass
-
-    result = CeoProcessResult(
-        file_name=file_name,
-        status="error",
-        source_kind="scan",
-        title=title,
-        speaker=speaker,
-        recorded_at=recorded_at,
-    )
-
-    if is_generated_vad_file(file_name):
-        result.status = "skipped_duplicate"
-        result.warning = "VAD 生成物（*_vad.wav）と判定したためスキップしました。"
-        return result
-
-    db = next(get_db())
-    try:
-        existing = find_duplicate(
-            db,
-            source_file_path=str(src),
-            size_bytes=source_file_size_bytes,
-            modified_at=source_file_modified_at,
-        )
-        if existing is not None:
-            result.status = "skipped_duplicate"
-            result.matched_existing_id = existing.id
-            result.record_id = existing.id
-            result.transcript = existing.transcript
-            result.duration_seconds = existing.duration_seconds
-            return result
-    finally:
-        db.close()
-
-    vad_tmp_path: Optional[str] = None
-    saved_vad_path: Optional[str] = None
-    try:
-        stt_input_path = str(src)
-        original_duration: Optional[float] = None
-        if use_vad and _should_apply_vad(
-            file_path=str(src),
-            size_bytes=source_file_size_bytes,
-            result=result,
-        ):
-            try:
-                fd, vad_tmp_path = tempfile.mkstemp(suffix=".wav")
-                os.close(fd)
-                vad_res = trim_non_speech(
-                    str(src),
-                    enabled=True,
-                    aggressiveness=int(vad_aggressiveness),
-                    output_path=vad_tmp_path,
-                )
-                vad_tmp_path = vad_res.output_path
-                stt_input_path = vad_tmp_path
-                original_duration = vad_res.orig_sec
-                if vad_res.orig_sec > 0:
-                    reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
-                    result.vad_note = (
-                        f"VAD: {vad_res.orig_sec:.2f}s → {vad_res.out_sec:.2f}s "
-                        f"(−{reduced:.1f}%) [{vad_res.method}]"
-                    )
-                else:
-                    result.vad_note = f"VAD: 入力長 0 秒 [{vad_res.method}]"
-            except Exception as exc:
-                logger.warning("CEO VAD 前処理に失敗したためスキップ: %s", exc)
-                result.warning = f"VAD 前処理に失敗したため元音声を使用します: {exc}"
-                stt_input_path = str(src)
-
-        if vad_tmp_path and os.path.exists(vad_tmp_path):
-            try:
-                saved_vad_path = _save_vad_output_next_to_source(vad_tmp_path, str(src))
-                stt_input_path = saved_vad_path
-                vad_tmp_path = None
-            except Exception as exc:
-                logger.warning("CEO VAD 出力の元フォルダ保存に失敗: %s", exc)
-
-        wrapper = STTModelWrapper(selected_model)
-        transcription = wrapper.transcribe(stt_input_path)
-        error_msg: Optional[str] = None
-        if isinstance(transcription, tuple) and transcription[0] is None:
-            error_msg = transcription[1] if len(transcription) > 1 else "STT failed"
-            transcription = None
-
-        if not transcription:
-            result.status = "error"
-            result.error = error_msg or "文字起こし結果が空でした"
-            return result
-
-        duration = original_duration or _safe_duration(str(src), stt_input_path)
-
-        db = next(get_db())
-        try:
-            saved_path_for_db = saved_vad_path or str(src)
-            record = CeoTranscription(
-                file_path=saved_path_for_db,
-                local_file_path=saved_vad_path,
-                source_file_path=str(src),
-                source_file_size_bytes=source_file_size_bytes,
-                source_file_modified_at=source_file_modified_at,
-                source_file_hash=None,
-                title=title,
-                speaker=speaker,
-                recorded_at=recorded_at,
-                model_id=selected_model,
-                language_code=None,
-                transcript=transcription,
-                structured_json=None,
-                duration_seconds=duration,
-                tags="社長音声",
-                created_at=datetime.now(),
-            )
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-            result.record_id = record.id
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-
-        result.status = "ok"
-        result.transcript = transcription
-        result.duration_seconds = duration
-        result.saved_path = saved_vad_path
-        return result
-
-    except Exception as exc:
-        logger.exception("CEO 音声処理（パス指定）で例外: %s", exc)
-        result.status = "error"
-        result.error = str(exc)
-        return result
-    finally:
-        if vad_tmp_path and os.path.exists(vad_tmp_path):
-            try:
-                os.unlink(vad_tmp_path)
-            except OSError:
-                pass
-        if result.status != "ok" and saved_vad_path and os.path.exists(saved_vad_path):
-            try:
-                os.unlink(saved_vad_path)
-            except OSError:
-                pass
-
-
 def process_ceo_uploaded_path(
     *,
     file_name: str,
@@ -687,11 +357,10 @@ def process_ceo_uploaded_path(
     use_vad: bool = True,
     vad_aggressiveness: int = 2,
     cleanup_source: bool = False,
-    source_kind: str = "upload",
 ) -> CeoProcessResult:
-    """アップロード済み一時ファイルを処理して `ceo_transcriptions` に保存する。
+    """ブラウザのマイク録音一時ファイルを処理して `ceo_transcriptions` に保存する。
 
-    Streamlit の UploadedFile を session_state にbytesで保持しないため、
+    `st.audio_input` の戻り値を session_state にbytesで保持しないため、
     UI側で一時ファイルへ退避したパスを受け取る。
     """
 
@@ -704,8 +373,7 @@ def process_ceo_uploaded_path(
             source_file_size_bytes = None
     if source_file_hash is None:
         source_file_hash = _sha256_file(str(src))
-    normalized_source_kind = "mic" if source_kind == "mic" else "upload"
-    source_file_path = _browser_source_key(normalized_source_kind, file_name, source_file_hash)
+    source_file_path = _mic_source_key(file_name, source_file_hash)
 
     title = (title or Path(file_name).stem or "社長音声").strip()
     speaker = (speaker or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
@@ -714,7 +382,7 @@ def process_ceo_uploaded_path(
     result = CeoProcessResult(
         file_name=file_name,
         status="error",
-        source_kind=normalized_source_kind,
+        source_kind="mic",
         title=title,
         speaker=speaker,
         recorded_at=recorded_at,
@@ -790,7 +458,7 @@ def process_ceo_uploaded_path(
                 _append_warning(result, f"VAD 前処理に失敗したため元音声を使用します: {exc}")
                 stt_input_path = str(src)
 
-        # 4. VAD ファイルは元フォルダ相当の保存先（CEO_VAD_OUTPUT_DIR）にコピー保存
+        # 4. VAD ファイルはマイク録音用の保存先（CEO_VAD_OUTPUT_DIR）にコピー保存
         if vad_path and os.path.exists(vad_path):
             try:
                 saved_vad_path = _save_vad_output(vad_path, file_name)
@@ -873,60 +541,5 @@ def process_ceo_uploaded_path(
         if result.status != "ok" and saved_vad_path and os.path.exists(saved_vad_path):
             try:
                 os.unlink(saved_vad_path)
-            except OSError:
-                pass
-
-
-def process_ceo_file(
-    *,
-    file_name: str,
-    file_bytes: bytes,
-    title: Optional[str],
-    speaker: Optional[str],
-    recorded_at: Optional[str],
-    source_file_modified_at: Optional[str] = None,
-    selected_model: str = DEFAULT_CEO_MODEL,
-    use_vad: bool = True,
-    vad_aggressiveness: int = 2,
-) -> CeoProcessResult:
-    """1つの社長音声ファイルを処理して `ceo_transcriptions` に保存する。
-
-    互換用のbytes受け口。UIはメモリ節約のため process_ceo_uploaded_path を使う。
-    """
-
-    suffix = Path(file_name).suffix or ".wav"
-    tmp_path: Optional[str] = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            tmp_file.write(file_bytes)
-            tmp_path = tmp_file.name
-        return process_ceo_uploaded_path(
-            file_name=file_name,
-            temp_file_path=tmp_path,
-            title=title,
-            speaker=speaker,
-            recorded_at=recorded_at,
-            source_file_size_bytes=len(file_bytes) if file_bytes is not None else None,
-            source_file_modified_at=source_file_modified_at,
-            selected_model=selected_model,
-            use_vad=use_vad,
-            vad_aggressiveness=vad_aggressiveness,
-            cleanup_source=True,
-        )
-    except Exception as exc:
-        logger.exception("CEO 音声処理で例外: %s", exc)
-        return CeoProcessResult(
-            file_name=file_name,
-            status="error",
-            source_kind="upload",
-            title=title,
-            speaker=speaker,
-            recorded_at=recorded_at,
-            error=str(exc),
-        )
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
             except OSError:
                 pass

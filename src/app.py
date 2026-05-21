@@ -73,8 +73,7 @@ if "mic_audio_bytes" not in st.session_state:
 # AppSettings はディスク（.app_settings.json）から毎回ロードされるため、
 # session_state には常に最新の参照を入れ替えておく。
 # 初回ガード（"settings" not in st.session_state）にすると、画面再描画後に
-# CEO タブ等から取り出すインスタンスが古いままになり「保存したのに反映されない」
-# 症状になる（実際にそれで参照フォルダが「未設定」表示になっていた）。
+# 各タブから取り出すインスタンスが古いままになり、保存した設定が反映されない。
 st.session_state.settings = settings
 
 with st.sidebar:
