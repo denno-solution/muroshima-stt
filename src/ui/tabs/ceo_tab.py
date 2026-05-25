@@ -68,7 +68,7 @@ def _ceo_vad_settings() -> tuple[bool, int]:
     return use_vad, vad_aggr
 
 
-def _suffix_from_audio_upload(uf, default: str = ".webm") -> str:
+def _suffix_from_audio_upload(uf, default: str = ".wav") -> str:
     name_suffix = Path(getattr(uf, "name", "") or "").suffix
     if name_suffix:
         return name_suffix
@@ -420,31 +420,51 @@ def _render_mic_recorder(selected_model: str, logger) -> None:
 
         audio_value = st.audio_input(
             "🎙️ 社長音声を録音してください",
-            help="録音を停止したあと、「社長音声として取り込む」を押してください。",
+            sample_rate=16000,
+            help="録音を停止すると自動で文字起こしと保存を開始します。",
             key="ceo_mic_audio_input",
         )
         if not audio_value:
             return
 
-        st.success("録音完了！")
+        st.success("録音完了。社長音声として取り込みます。")
         current_digest = _audio_value_digest(audio_value)
-        if current_digest and st.session_state.get("ceo_mic_last_digest") == current_digest:
-            st.caption("この録音は直近で取り込み済みです。再取り込みした場合は重複として扱われます。")
+        if not current_digest:
+            st.error("録音データの確認に失敗しました。もう一度録音してください。")
+            return
 
         disabled = bool(st.session_state.get("ceo_mic_processing", False))
-        if not st.button(
-            "社長音声として取り込む",
-            type="primary",
-            use_container_width=True,
-            disabled=disabled,
-            key="ceo_mic_process_button",
-        ):
+        if disabled:
+            st.info("社長音声を取り込み中です。")
+            return
+
+        already_processed = st.session_state.get("ceo_mic_last_digest") == current_digest
+        retry = False
+        if already_processed:
+            st.caption("この録音は直近で取り込み済みです。")
+            retry = st.button(
+                "同じ録音を再処理",
+                use_container_width=True,
+                disabled=disabled,
+                key="ceo_mic_retry_button",
+            )
+        if already_processed and not retry:
             return
 
         st.session_state.ceo_mic_processing = True
         files: list[dict] = []
         try:
             files = [_persist_mic_recording(audio_value)]
+            if files:
+                first = files[0]
+                logger.info(
+                    "CEO 録音受領: name=%s size=%s type=%s hash=%s",
+                    first.get("file_name"),
+                    first.get("size_bytes"),
+                    getattr(audio_value, "type", ""),
+                    first.get("source_file_hash"),
+                )
+                st.info(f"録音データを受領しました（{(first.get('size_bytes') or 0) / (1024 * 1024):.1f}MB）")
             speaker = (speaker_input or DEFAULT_CEO_SPEAKER).strip() or DEFAULT_CEO_SPEAKER
             title_override = title_input.strip()
             recorded_at_override = recorded_at_input.strip() or None
@@ -481,7 +501,7 @@ def _render_mic_recorder(selected_model: str, logger) -> None:
 
 def run_ceo_tab(selected_model: str, logger) -> None:
     st.header("社長音声")
-    st.caption("ブラウザのマイク録音を、社長音声として VAD 後に文字起こしします。")
+    st.caption("ブラウザのマイク録音を、社長音声として文字起こしします。")
 
     state = _ensure_state()
 

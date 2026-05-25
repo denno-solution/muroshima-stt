@@ -1,6 +1,7 @@
 import hashlib
 import logging
 from pathlib import Path
+import subprocess
 
 import librosa
 import soundfile as sf
@@ -49,7 +50,33 @@ def get_audio_duration_metadata(src_path: str) -> float:
         info = sf.info(src_path)
         return float(info.duration or 0.0)
     except Exception:
-        try:
-            return float(librosa.get_duration(path=src_path))
-        except Exception:
-            return 0.0
+        pass
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                src_path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if completed.returncode == 0:
+            value = completed.stdout.strip()
+            if value and value != "N/A":
+                return float(value)
+    except Exception:
+        pass
+
+    try:
+        return float(librosa.get_duration(path=src_path))
+    except Exception:
+        return 0.0

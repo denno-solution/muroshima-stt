@@ -35,8 +35,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CEO_MODEL = "ElevenLabs"
 DEFAULT_CEO_SPEAKER = "社長"
-DEFAULT_CEO_VAD_MAX_BYTES = 200 * 1024 * 1024
-DEFAULT_CEO_VAD_MAX_DURATION_SECONDS = 60 * 60
+DEFAULT_CEO_VAD_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_CEO_VAD_MAX_DURATION_SECONDS = 15 * 60
+DEFAULT_CEO_DURATION_DECODE_MAX_BYTES = 25 * 1024 * 1024
 
 
 @dataclass
@@ -141,7 +142,7 @@ def _safe_duration(file_path: str, fallback_path: Optional[str] = None) -> Optio
             size_bytes = os.path.getsize(candidate)
         except OSError:
             size_bytes = 0
-        if size_bytes and size_bytes > _env_int("CEO_DURATION_DECODE_MAX_BYTES", DEFAULT_CEO_VAD_MAX_BYTES):
+        if size_bytes and size_bytes > _env_int("CEO_DURATION_DECODE_MAX_BYTES", DEFAULT_CEO_DURATION_DECODE_MAX_BYTES):
             continue
         duration = get_audio_duration(candidate)
         if duration:
