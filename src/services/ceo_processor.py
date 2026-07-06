@@ -495,6 +495,8 @@ def process_ceo_uploaded_path(
                 source_file_size_bytes=source_file_size_bytes,
                 source_file_modified_at=source_file_modified_at,
                 source_file_hash=source_file_hash,
+                source_app="web",
+                input_method="mic",
                 title=title,
                 speaker=speaker,
                 recorded_at=recorded_at,

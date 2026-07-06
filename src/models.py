@@ -109,6 +109,8 @@ class CeoTranscription(Base):
     source_file_size_bytes = Column(Integer, nullable=True)
     source_file_modified_at = Column(String(64), nullable=True)
     source_file_hash = Column(String(64), nullable=True)
+    source_app = Column(String(32), nullable=False, default="unknown", server_default=text("'unknown'"))
+    input_method = Column(String(32), nullable=False, default="unknown", server_default=text("'unknown'"))
     title = Column(String(500), nullable=True)
     speaker = Column(String(200), nullable=True)
     recorded_at = Column(String(64), nullable=True)
@@ -300,6 +302,8 @@ _ensure_columns(
         "source_file_size_bytes": "INTEGER",
         "source_file_modified_at": "TEXT",
         "source_file_hash": "TEXT",
+        "source_app": "TEXT NOT NULL DEFAULT 'unknown'",
+        "input_method": "TEXT NOT NULL DEFAULT 'unknown'",
         "title": "TEXT",
         "speaker": "TEXT",
         "recorded_at": "TEXT",
