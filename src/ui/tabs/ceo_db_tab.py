@@ -11,6 +11,7 @@ import streamlit as st
 from sqlalchemy import delete
 
 from models import CeoTranscription, get_db
+from services.ceo_time_utils import ceo_record_sort_key
 
 
 SOURCE_APP_LABELS = {
@@ -45,11 +46,7 @@ def _ensure_state() -> None:
 def _load_records():
     db = next(get_db())
     try:
-        records = (
-            db.query(CeoTranscription)
-            .order_by(CeoTranscription.recorded_at.desc(), CeoTranscription.created_at.desc())
-            .all()
-        )
+        records = sorted(db.query(CeoTranscription).all(), key=ceo_record_sort_key)
     finally:
         db.close()
 
