@@ -11,7 +11,11 @@ import streamlit as st
 from sqlalchemy import delete
 
 from models import CeoTranscription, get_db
-from services.ceo_time_utils import ceo_record_sort_key
+from services.ceo_time_utils import (
+    ceo_record_sort_key,
+    format_created_at_for_web,
+    format_recorded_at_for_web,
+)
 
 
 SOURCE_APP_LABELS = {
@@ -58,6 +62,8 @@ def _load_records():
         input_method = record.input_method or "unknown"
         source_app_label = _label(source_app, SOURCE_APP_LABELS)
         input_method_label = _label(input_method, INPUT_METHOD_LABELS)
+        recorded_at_display = format_recorded_at_for_web(record.recorded_at)
+        created_at_display = format_created_at_for_web(record.created_at)
         table_rows.append(
             {
                 "ID": record.id,
@@ -65,8 +71,8 @@ def _load_records():
                 "話者": record.speaker or "-",
                 "登録元": source_app_label,
                 "取り込み方法": input_method_label,
-                "録音日時": record.recorded_at or "-",
-                "登録日時": record.created_at,
+                "録音日時": recorded_at_display,
+                "登録日時": created_at_display,
                 "長さ(s)": record.duration_seconds,
                 "ファイル": record.source_file_path or record.file_path or "-",
                 "文字起こし": transcript[:50] + ("…" if len(transcript) > 50 else ""),
@@ -78,8 +84,8 @@ def _load_records():
                 "id": record.id,
                 "title": record.title,
                 "speaker": record.speaker,
-                "recorded_at": record.recorded_at,
-                "created_at": record.created_at,
+                "recorded_at": recorded_at_display,
+                "created_at": created_at_display,
                 "duration_seconds": record.duration_seconds,
                 "source_file_path": record.source_file_path,
                 "source_file_size_bytes": record.source_file_size_bytes,
