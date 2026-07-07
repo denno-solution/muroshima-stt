@@ -67,6 +67,10 @@ def format_recorded_at_for_web(value: Any) -> str:
 
 def format_created_at_for_web(value: Any) -> str:
     raw, converted = _aware_as_jst_naive(value)
-    if converted is None:
+    if converted is not None:
+        return converted.strftime("%Y-%m-%d %H:%M:%S")
+
+    parsed = parse_timestamp(value)
+    if parsed is None:
         return raw
-    return str(converted)
+    return parsed.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,16 +76,26 @@ def test_web_recorded_at_display_uses_main_recording_format(jst_timezone):
     assert format_recorded_at_for_web("2026-07-07T11:02:00+09:00") == "2026-07-07T11:02:00"
 
 
-def test_web_created_at_display_keeps_main_web_values_and_localizes_aware_values(jst_timezone):
+def test_web_created_at_display_uses_seconds_and_localizes_aware_values(jst_timezone):
     assert (
         format_created_at_for_web("2026-07-07 11:02:30.572861")
-        == "2026-07-07 11:02:30.572861"
+        == "2026-07-07 11:02:30"
     )
     assert (
         format_created_at_for_web("2026-07-07T02:03:13.856666+00:00")
-        == "2026-07-07 11:03:13.856666"
+        == "2026-07-07 11:03:13"
     )
     assert format_created_at_for_web("2026-07-07T02:03:13+00:00") == "2026-07-07 11:03:13"
+    assert (
+        format_created_at_for_web(datetime(2026, 7, 7, 11, 37, 58, 310708))
+        == "2026-07-07 11:37:58"
+    )
+    assert (
+        format_created_at_for_web(
+            datetime(2026, 7, 7, 2, 37, 58, 310708, tzinfo=timezone.utc)
+        )
+        == "2026-07-07 11:37:58"
+    )
 
 
 def test_record_sort_key_does_not_depend_on_process_timezone():
