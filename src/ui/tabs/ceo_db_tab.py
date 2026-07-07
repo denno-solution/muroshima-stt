@@ -11,6 +11,29 @@ import streamlit as st
 from sqlalchemy import delete
 
 from models import CeoTranscription, get_db
+from services.ceo_time_utils import (
+    ceo_record_sort_key,
+    format_created_at_for_web,
+    format_recorded_at_for_web,
+)
+
+
+SOURCE_APP_LABELS = {
+    "web": "Web版",
+    "desktop": "アプリ版",
+    "unknown": "未判定",
+}
+
+INPUT_METHOD_LABELS = {
+    "mic": "マイク録音",
+    "file_import": "ファイル取り込み",
+    "unknown": "未判定",
+}
+
+
+def _label(value, labels: dict[str, str]) -> str:
+    raw = str(value or "unknown").strip() or "unknown"
+    return labels.get(raw, raw)
 
 
 def _ensure_state() -> None:
@@ -27,11 +50,7 @@ def _ensure_state() -> None:
 def _load_records():
     db = next(get_db())
     try:
-        records = (
-            db.query(CeoTranscription)
-            .order_by(CeoTranscription.recorded_at.desc(), CeoTranscription.created_at.desc())
-            .all()
-        )
+        records = sorted(db.query(CeoTranscription).all(), key=ceo_record_sort_key)
     finally:
         db.close()
 
@@ -39,13 +58,21 @@ def _load_records():
     detail_rows: list[dict] = []
     for record in records:
         transcript = record.transcript or ""
+        source_app = record.source_app or "unknown"
+        input_method = record.input_method or "unknown"
+        source_app_label = _label(source_app, SOURCE_APP_LABELS)
+        input_method_label = _label(input_method, INPUT_METHOD_LABELS)
+        recorded_at_display = format_recorded_at_for_web(record.recorded_at)
+        created_at_display = format_created_at_for_web(record.created_at)
         table_rows.append(
             {
                 "ID": record.id,
                 "タイトル": record.title or "-",
                 "話者": record.speaker or "-",
-                "録音日時": record.recorded_at or "-",
-                "登録日時": record.created_at,
+                "登録元": source_app_label,
+                "取り込み方法": input_method_label,
+                "録音日時": recorded_at_display,
+                "登録日時": created_at_display,
                 "長さ(s)": record.duration_seconds,
                 "ファイル": record.source_file_path or record.file_path or "-",
                 "文字起こし": transcript[:50] + ("…" if len(transcript) > 50 else ""),
@@ -57,13 +84,17 @@ def _load_records():
                 "id": record.id,
                 "title": record.title,
                 "speaker": record.speaker,
-                "recorded_at": record.recorded_at,
-                "created_at": record.created_at,
+                "recorded_at": recorded_at_display,
+                "created_at": created_at_display,
                 "duration_seconds": record.duration_seconds,
                 "source_file_path": record.source_file_path,
                 "source_file_size_bytes": record.source_file_size_bytes,
                 "source_file_modified_at": record.source_file_modified_at,
                 "source_file_hash": record.source_file_hash,
+                "source_app": source_app,
+                "source_app_label": source_app_label,
+                "input_method": input_method,
+                "input_method_label": input_method_label,
                 "file_path": record.file_path,
                 "local_file_path": record.local_file_path,
                 "model_id": record.model_id,
@@ -141,6 +172,8 @@ def run_ceo_db_tab() -> None:
         q = text_filter.strip().lower()
         mask = (
             filtered["タイトル"].astype(str).str.lower().str.contains(q, regex=False, na=False)
+            | filtered["登録元"].astype(str).str.lower().str.contains(q, regex=False, na=False)
+            | filtered["取り込み方法"].astype(str).str.lower().str.contains(q, regex=False, na=False)
             | filtered["_文字起こし全文"].astype(str).str.lower().str.contains(q, regex=False, na=False)
             | filtered["ファイル"].astype(str).str.lower().str.contains(q, regex=False, na=False)
         )
@@ -168,6 +201,8 @@ def run_ceo_db_tab() -> None:
         with meta_l:
             st.write(f"**タイトル:** {record['title'] or '-'}")
             st.write(f"**話者:** {record['speaker'] or '-'}")
+            st.write(f"**登録元:** {record['source_app_label']}")
+            st.write(f"**取り込み方法:** {record['input_method_label']}")
             st.write(f"**録音日時:** {record['recorded_at'] or '-'}")
             st.write(f"**登録日時:** {record['created_at']}")
             st.write(f"**長さ:** {record['duration_seconds']}")
