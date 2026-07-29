@@ -52,7 +52,7 @@ def run_openai_transcription(audio_files):
         from transcribe_openai import transcribe_audio_file
         results = {}
         
-        print("\n=== OpenAI gpt-4o-transcribe ===")
+        print("\n=== OpenAI gpt-transcribe ===")
         for i, audio_file in enumerate(audio_files, 1):
             print(f"[{i}/{len(audio_files)}] {audio_file.name}")
             transcription = transcribe_audio_file(audio_file)
@@ -72,10 +72,10 @@ def run_google_transcription(audio_files):
         from transcribe_google import transcribe_audio_file
         results = {}
         
-        print("\n=== Google Cloud Speech-to-Text (Chirp) ===")
+        print("\n=== Google Cloud Speech-to-Text (Chirp 3) ===")
         for i, audio_file in enumerate(audio_files, 1):
             print(f"[{i}/{len(audio_files)}] {audio_file.name}")
-            transcription = transcribe_audio_file(audio_file, model="chirp")
+            transcription = transcribe_audio_file(audio_file, model="chirp_3")
             if transcription:
                 results[audio_file.name] = transcription
             else:

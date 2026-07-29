@@ -186,7 +186,7 @@ uv lock --upgrade
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
 - DB関連の実装・最適化はlibSQLのベクトル関数（`vector_top_k`, `vector_distance_cos`, `libsql_vector_idx`）とFTS5のみを前提にしてください。
 - QA検索タブの回答生成は「ストリーミングのみ」です。非ストリーミングAPIはコードから撤去済みです。
-- 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5-mini`。Responses APIを使用。
+- 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5.6-luna`。Responses APIを使用。
 - `EMBEDDING_DIM` を変更する場合はDB列定義が固定のため、再作成（既存チャンク削除→再インデックス）が必要。
 - プロンプトは番号付きコンテキスト＋出典必須（[#番号]）で構成。回答/根拠/不足情報の3セクション出力を期待。
 - 温度は既定値（未指定）。再現性が要る場合は `.env` で上書きではなくプロンプト・候補件数を調整する。

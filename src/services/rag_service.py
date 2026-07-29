@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "600"))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-# 2025-10 時点：gpt-5 系列を既定に（Responses API 対応、品質/コスパ良好）。
-COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-5-mini")
+# Responses API 対応モデルを既定に。
+COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-5.6-luna")
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in {"1", "true", "yes", "on"}
 
 # Hybrid search parameters
