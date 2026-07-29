@@ -19,7 +19,7 @@ def transcribe_audio_file(audio_file_path):
     try:
         with open(audio_file_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",  # 現在利用可能なモデルです
+                model="gpt-transcribe",
                 file=audio_file
             )
             return transcription.text

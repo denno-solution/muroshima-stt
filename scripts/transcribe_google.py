@@ -8,16 +8,17 @@ from google.cloud.speech_v2.types import cloud_speech
 
 # Google Cloud プロジェクトID
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us")
 if not PROJECT_ID:
     print("警告: GOOGLE_CLOUD_PROJECT環境変数が設定されていません。")
     PROJECT_ID = "your-project-id"  # ここにプロジェクトIDを設定
 
-def transcribe_audio_file(audio_file_path, model="chirp", language_code="ja-JP"):
-    """Google Cloud Speech-to-Text (Chirp/Chirp2)で音声ファイルを文字起こしする
+def transcribe_audio_file(audio_file_path, model="chirp_3", language_code="ja-JP"):
+    """Google Cloud Speech-to-Text (Chirp)で音声ファイルを文字起こしする
     
     Args:
         audio_file_path: 音声ファイルのパス
-        model: 使用するモデル ("chirp" または "chirp_2")
+        model: 使用するモデル ("chirp", "chirp_2", "chirp_3")
         language_code: 言語コード (例: "ja-JP", "en-US")
     
     Returns:
@@ -27,7 +28,7 @@ def transcribe_audio_file(audio_file_path, model="chirp", language_code="ja-JP")
         # クライアントの初期化
         client = SpeechClient(
             client_options=ClientOptions(
-                api_endpoint="us-central1-speech.googleapis.com",
+                api_endpoint=f"{LOCATION}-speech.googleapis.com",
             )
         )
         
@@ -39,12 +40,12 @@ def transcribe_audio_file(audio_file_path, model="chirp", language_code="ja-JP")
         config = cloud_speech.RecognitionConfig(
             auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
             language_codes=[language_code],
-            model=model,  # "chirp" または "chirp_2"
+            model=model,
         )
         
         # リクエストの作成
         request = cloud_speech.RecognizeRequest(
-            recognizer=f"projects/{PROJECT_ID}/locations/us-central1/recognizers/_",
+            recognizer=f"projects/{PROJECT_ID}/locations/{LOCATION}/recognizers/_",
             config=config,
             content=audio_content,
         )
@@ -77,7 +78,7 @@ def save_transcription(filename, transcription, output_dir):
     
     return output_path
 
-def process_all_audio_files(model="chirp"):
+def process_all_audio_files(model="chirp_3"):
     """dataディレクトリ内のすべての音声ファイルを処理"""
     # パスの設定
     base_dir = Path(__file__).parent.parent
@@ -133,9 +134,9 @@ def process_all_audio_files(model="chirp"):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Google Cloud Speech-to-Text (Chirp/Chirp2)')
-    parser.add_argument('--model', choices=['chirp', 'chirp_2'], default='chirp',
-                        help='使用するモデル (default: chirp)')
+    parser = argparse.ArgumentParser(description='Google Cloud Speech-to-Text (Chirp)')
+    parser.add_argument('--model', choices=['chirp', 'chirp_2', 'chirp_3'], default='chirp_3',
+                        help='使用するモデル (default: chirp_3)')
     args = parser.parse_args()
     
     process_all_audio_files(model=args.model)

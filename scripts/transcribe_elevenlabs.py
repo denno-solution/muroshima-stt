@@ -34,7 +34,7 @@ logger.addHandler(file_handler)
 
 # ElevenLabs設定（環境変数で挙動を制御可能）
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "scribe_v1")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "scribe_v2")
 # 既定は日本語に固定（UI 経由の呼び出しは従来言語未指定で自動判定だった）
 ELEVENLABS_DEFAULT_LANG = os.getenv("ELEVENLABS_LANGUAGE_CODE", "ja")
 ELEVENLABS_TAG_EVENTS = os.getenv("ELEVENLABS_TAG_AUDIO_EVENTS", "false").lower() in ("1", "true", "yes", "on")
@@ -94,12 +94,12 @@ def transcribe_audio_file(audio_file_path, language_code=None):
         with open(audio_file_path, "rb") as audio_file:
             logger.debug("音声ファイルを読み込み中...")
             # Speech-to-Text変換を実行
-            # Scribe v1モデルを使用
+            # Scribeモデルを使用
             logger.debug("API呼び出し開始...")
             # APIパラメータを構築
             api_params = {
                 "file": audio_file,
-                "model_id": ELEVENLABS_MODEL_ID,  # 既定は "scribe_v1"（env で上書き可）
+                "model_id": ELEVENLABS_MODEL_ID,  # 既定は "scribe_v2"（env で上書き可）
                 "tag_audio_events": ELEVENLABS_TAG_EVENTS,
             }
             
