@@ -4,7 +4,7 @@ Streamlitを使用した音声文字起こしWebアプリ。複数のSTTモデ�
 
 ## 運用メモ
 - 本番デプロイ先: Streamlit Community Cloud
-- Tauri版（デスクトップアプリ）: `/Users/uenomasaki/Documents/DENNO/stt-desktop`
+- Tauri版（デスクトップアプリ）: `../stt-desktop`（`stt-suite/stt-desktop`。本リポジトリの隣にある別リポジトリ）
 
 ## 課題管理
 
