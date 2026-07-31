@@ -7,14 +7,13 @@
 
 import json
 import logging
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_
 
 from models import RAGChatLog, USE_VECTOR, get_db
 from services.rag import highlight_date_in_query
@@ -93,44 +92,25 @@ def _load_session_history(session_id: str) -> List[Dict]:
         db.close()
 
 
-def _fetch_session_summaries(profile: _ChatProfile, keyword: str = "", limit: int = 20):
+def _fetch_session_summaries(profile: _ChatProfile, limit: int = 15):
     db = next(get_db())
     try:
-        session_ids_subq = None
-        if keyword:
-            session_ids_subq = (
-                db.query(RAGChatLog.session_id)
-                .filter(RAGChatLog.session_id.isnot(None))
-                .filter(_kind_filter(profile))
-                .filter(
-                    or_(
-                        RAGChatLog.user_text.contains(keyword),
-                        RAGChatLog.answer_text.contains(keyword),
-                    )
-                )
-                .distinct()
-                .subquery()
-            )
-
         base = (
             db.query(
                 RAGChatLog.session_id.label("session_id"),
                 func.min(RAGChatLog.created_at).label("first_created"),
                 func.max(RAGChatLog.created_at).label("last_updated"),
-                func.count(RAGChatLog.id).label("message_count"),
             )
             .filter(RAGChatLog.session_id.isnot(None))
             .filter(_kind_filter(profile))
+            .group_by(RAGChatLog.session_id)
+            .subquery()
         )
-        if session_ids_subq is not None:
-            base = base.filter(RAGChatLog.session_id.in_(select(session_ids_subq.c.session_id)))
-        base = base.group_by(RAGChatLog.session_id).subquery()
 
         return (
             db.query(
                 base.c.session_id,
                 base.c.last_updated,
-                base.c.message_count,
                 RAGChatLog.user_text.label("first_question"),
             )
             .join(
@@ -148,25 +128,18 @@ def _fetch_session_summaries(profile: _ChatProfile, keyword: str = "", limit: in
 
 def _render_session_picker(profile: _ChatProfile, session_id: str) -> None:
     with st.popover("🗂 過去の会話", use_container_width=True):
-        kw = st.text_input(
-            "キーワードで検索",
-            value="",
-            placeholder="例: ヒケ 保圧",
-            key=f"rag_{profile.key}_session_kw",
-        )
-        sessions = _fetch_session_summaries(profile, keyword=kw, limit=15)
+        sessions = _fetch_session_summaries(profile)
         if not sessions:
             st.caption("保存された会話はありません。")
         for s in sessions:
             title = (s.first_question or "（無題）").strip()
-            if len(title) > 32:
-                title = title[:32] + "…"
+            if len(title) > 26:
+                title = title[:26] + "…"
             prefix = "▶ " if s.session_id == session_id else ""
-            updated = str(s.last_updated)[:16]
+            updated = str(s.last_updated)[:10]  # YYYY-MM-DD
             if st.button(
-                f"{prefix}{title}",
+                f"{prefix}{updated}　{title}",
                 key=f"rag_{profile.key}_resume_{s.session_id}",
-                help=f"{updated} / {s.message_count}件のメッセージ",
                 use_container_width=True,
             ):
                 st.session_state[f"rag_{profile.key}_session_id"] = s.session_id
@@ -190,8 +163,6 @@ def _render_context_docs(contexts: List[Dict]) -> None:
                 caps.append(source)
             if ctx.get("tags"):
                 caps.append(f"🏷️ {ctx['tags']}")
-            if ctx.get("score") is not None:
-                caps.append(f"一致度 {ctx['score']:.2f}")
             caps.append("全文" if ctx.get("is_full_text") else "関連部分の抜粋")
             st.caption(" / ".join(caps))
             body = ctx.get("text") or ""
@@ -404,22 +375,6 @@ def _run_chat(profile: _ChatProfile):
     with ctrl_cols[2]:
         _render_session_picker(profile, session_id)
 
-    with st.expander("🔧 詳細設定", expanded=False):
-        alpha = st.slider(
-            "類似検索の重み",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.6,
-            step=0.05,
-            help="1.0に近いほど意味的な類似(ベクトル検索)を、0.0に近いほどキーワード一致を重視します",
-            key=f"rag_{profile.key}_alpha",
-        )
-        max_docs = st.number_input(
-            "参照する録音数の上限", min_value=1, max_value=15, value=6, step=1,
-            help="回答の根拠として読み込む録音の最大件数",
-            key=f"rag_{profile.key}_max_docs",
-        )
-
     # --- 会話履歴表示 ---
     for message in st.session_state[hist_key]:
         block = st.chat_message(message["role"])
@@ -453,8 +408,6 @@ def _run_chat(profile: _ChatProfile):
                 sources=profile.sources,
                 manual_date_range=manual_range,
                 chat_history=chat_history_for_rag,
-                alpha=alpha,
-                max_docs=int(max_docs),
             )
         except Exception as e:
             _handle_rag_error(e, "検索実行")
@@ -470,25 +423,15 @@ def _run_chat(profile: _ChatProfile):
     _render_search_badges(meta)
 
     with st.chat_message("assistant"):
-        tgen0 = time.time()
         try:
             full_text = st.write_stream(stream_fn()) if callable(stream_fn) else ""
         except Exception as e:
             _handle_rag_error(e, "回答生成")
             full_text = ""
-        tgen1 = time.time()
 
         if docs:
             with st.expander(f"参照した録音（{len(docs)}件）", expanded=False):
                 _render_context_docs(docs)
-
-    timings = meta.get("timings_ms") or {}
-    retrieval_s = (timings.get("retrieval") or 0) / 1000.0
-    gen_s = tgen1 - tgen0
-    st.caption(
-        f"参照: {meta.get('used_docs', 0)}録音（候補 {meta.get('candidates', 0)}チャンク） / "
-        f"検索 {retrieval_s:.1f}s / 回答生成 {gen_s:.1f}s"
-    )
 
     # --- 履歴・ログ保存 ---
     st.session_state[hist_key].append(
@@ -518,7 +461,7 @@ def _run_chat(profile: _ChatProfile):
             answer_text=full_text,
             contexts=contexts_json,
             used_hybrid=True,
-            alpha=float(alpha),
+            alpha=None,  # UI設定を廃止(既定値RAG_HYBRID_ALPHAで動作)
             date_filter_applied=bool(meta.get("date_filter")),
         )
         db2.add(log)
