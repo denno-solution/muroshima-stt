@@ -4,7 +4,7 @@ Streamlitを使用した音声文字起こしWebアプリ。複数のSTTモデ�
 
 ## 運用メモ
 - 本番デプロイ先: Streamlit Community Cloud
-- Tauri版（デスクトップアプリ）: `/Users/uenomasaki/Documents/DENNO/stt-desktop`
+- Tauri版（デスクトップアプリ）: `../stt-desktop`（`stt-suite/stt-desktop`。本リポジトリの隣にある別リポジトリ）
 
 ## 課題管理
 
@@ -183,16 +183,28 @@ uv lock --upgrade
 - **ドキュメント作成制限**: 明示的に要求されない限り*.mdファイル作成禁止
 
 - RAG機能は Turso(libSQL) 専用です（Postgres対応は削除）。
-- `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-small), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
+- `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-large、dimensions=1536で格納), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
-- Streamlit UIに「💬 QA検索」タブがあり、検索件数スライダーとチャット履歴表示、参照チャンクのスコア/メタ情報の閲覧が可能。
+- Streamlit UIのQAチャットは「💬 現場録音に質問」「💬 社長音声に質問」の2タブに分離（検索エンジンは共通、検索対象・会話履歴・プロンプトが別）。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
 ## Agent Notes（RAG開発向けメモ）
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
-- DB関連の実装・最適化はlibSQLのベクトル関数（`vector_top_k`, `vector_distance_cos`, `libsql_vector_idx`）とFTS5のみを前提にしてください。
+- QAチャット（「現場録音に質問」「社長音声に質問」タブ）のアーキテクチャ:
+  - 出口は現場録音用と社長音声用で分離（`ui/tabs/rag_tab.py`の`_ChatProfile`）。会話ログは`rag_chat_logs.chat_kind`（"audio"/"ceo"、NULLは旧データ=audio扱い）で区別
+  - 新規保存分は保存時に即時索引化（現場録音: upload_tab/mic_tab、社長音声: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
+  - 検索モードは3種: `search`（ハイブリッド検索）/ `browse`（期間・要約だけが手がかりの質問。新しい順に最大`RAG_AGGREGATE_MAX_DOCS`=30件を薄く読む）/ `followup`（形式変更・メタ質問。再検索せず前回の参照録音を再利用）
+  - `services/rag/query_cleaner.py`: 検索計画の判断材料（指示語除去・内容語判定・集約/追問判定・STT表記ゆれ同義語辞書）。同義語はprodコーパス走査で実在確認したもののみ登録（ヒケ=引け、ソリ=反り等）。指示語バイグラムはBM25を汚染するためFTSクエリから除外する（実測nDCG@6 0.47→0.64）
+  - `services/rag/search_service.py`: 検索実行層。ベクトル検索（`vector_distance_cos`全走査+SQL日付フィルタ）/ キーワード検索（FTS5）/ 期間ブラウズの3操作。Phase 2（agentic search）ではこれらをLLMのツールとして公開する想定
+  - `services/rag/tokenizer.py`: FTS5用の文字バイグラムトークナイザ。索引テーブルは`rag_fts_audio`/`rag_fts_ceo`（Python側で行を管理、トリガ無し）。現場用語・型番の完全一致検索を辞書非依存で保証
+  - `services/rag/date_utils.py`: クエリからの日付範囲抽出（「7/28」「先月」に加え「X～Y」「XからYまで」の範囲も対応）。検索は正規化済み`recorded_date`列（JST, YYYY-MM-DD）へのSQL WHEREで行う（事後フィルタ禁止）
+  - `services/rag/context_builder.py`: コンテキストは録音単位（短い録音は全文、長い録音はヒット周辺の結合）。チャンク断片をそのまま渡さない。browse/集約時は`per_doc_cap`で1件を薄くして件数を優先
+  - `services/rag/reconcile.py` + `RAGService.reconcile()`: デスクトップ版保存分・社長音声の索引差分を補完。UIから自動/ボタン実行、CLIは`scripts/backfill_rag.py`
+  - 期間拡大・部分参照などの検索側の事情は`build_chat_messages(notes=…)`でモデルに明示する（モデルが期間外の録音を「日付の矛盾」と誤解しないように）
+- ハイブリッド検索の融合は重み付きRRF（Reciprocal Rank Fusion）。スコアの絶対値でのブレンドはキャリブレーション問題があるため禁止。`RAG_HYBRID_ALPHA`既定0.4（prod実データ評価でキーワード側が強いため）
+- `created_at`はWeb版（naive UTC）とデスクトップ版（RFC3339 UTC）で形式が混在。日付判定には必ず`recorded_date`を使う
 - QA検索タブの回答生成は「ストリーミングのみ」です。非ストリーミングAPIはコードから撤去済みです。
-- 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5.6-luna`。Responses APIを使用。
+- 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-large`（`dimensions=1536`で格納、スキーマ変更不要）, `RAG_COMPLETION_MODEL=gpt-5.6-luna`。Responses APIを使用。
+- 埋め込みモデルを変更すると、索引時モデルを記録する`rag_index_meta`マーカーとの不一致で全録音が自動的に再索引対象になる（QAタブのボタン1回 or `scripts/backfill_rag.py`で移行。旧ベクトルとの混在を防ぐため）。
 - `EMBEDDING_DIM` を変更する場合はDB列定義が固定のため、再作成（既存チャンク削除→再インデックス）が必要。
-- プロンプトは番号付きコンテキスト＋出典必須（[#番号]）で構成。回答/根拠/不足情報の3セクション出力を期待。
-- 温度は既定値（未指定）。再現性が要る場合は `.env` で上書きではなくプロンプト・候補件数を調整する。
+- 検索品質の確認は `uv run python scripts/eval_rag.py "質問"`（検索計画と参照録音を表示。生成なし）。

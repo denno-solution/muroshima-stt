@@ -1,30 +1,74 @@
-import os
+"""音声DBへの質問(QAチャット)タブ。
+
+現場録音用(run_rag_tab)と社長音声用(run_ceo_rag_tab)で出口を分離している。
+検索エンジン(RAGService)は共通で、検索対象・会話履歴・プロンプトが
+プロファイル単位で切り替わる。
+"""
+
 import json
-import time
-import uuid
 import logging
+import uuid
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Dict, List, Optional, Tuple
+
 import streamlit as st
-from datetime import datetime, date
-from typing import List, Dict, Optional
+from sqlalchemy import func, or_
 
-from sqlalchemy import func, or_, select
-
-from models import AudioTranscriptionChunk, USE_VECTOR, VECTOR_BACKEND, get_db, RAGChatLog
+from models import RAGChatLog, USE_VECTOR, get_db
 from services.rag import highlight_date_in_query
 from services.rag_service import get_rag_service
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
 
-def _get_or_create_session_id() -> str:
-    """現在のセッションIDを取得、なければ新規作成"""
-    if "rag_session_id" not in st.session_state:
-        st.session_state.rag_session_id = str(uuid.uuid4())
-    return st.session_state.rag_session_id
+# 自動インデックスを黙って実行する上限(超える場合はボタンで明示実行)
+_AUTO_INDEX_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _ChatProfile:
+    """QAチャットの出口ごとの設定。現場録音と社長音声で会話・検索対象を分離する。"""
+
+    key: str  # session_state・ウィジェットkey・chat_kindの識別子("audio"/"ceo")
+    sources: Tuple[str, ...]
+    header: str
+    placeholder: str
+
+
+_AUDIO_PROFILE = _ChatProfile(
+    key="audio",
+    sources=("audio",),
+    header="💬 現場録音に質問",
+    placeholder="質問を入力（例: 7/28の作業内容は？ / ボイドが出たとき過去はどう対処した？）",
+)
+_CEO_PROFILE = _ChatProfile(
+    key="ceo",
+    sources=("ceo",),
+    header="💬 社長音声に質問",
+    placeholder="質問を入力（例: 最近の録音の内容をまとめて / 〇〇の件はどういう話だった？）",
+)
+
+
+# ----------------------------------------------------------------------
+# セッション管理
+# ----------------------------------------------------------------------
+def _get_or_create_session_id(profile: _ChatProfile) -> str:
+    key = f"rag_{profile.key}_session_id"
+    if key not in st.session_state:
+        st.session_state[key] = str(uuid.uuid4())
+    return st.session_state[key]
+
+
+def _kind_filter(profile: _ChatProfile):
+    """会話ログの出口別フィルタ。旧データ(chat_kind=NULL)は現場録音として扱う。"""
+    if profile.key == "ceo":
+        return RAGChatLog.chat_kind == "ceo"
+    return or_(RAGChatLog.chat_kind == "audio", RAGChatLog.chat_kind.is_(None))
 
 
 def _load_session_history(session_id: str) -> List[Dict]:
-    """DBからセッションの履歴を復元"""
     db = next(get_db())
     try:
         logs = (
@@ -36,121 +80,37 @@ def _load_session_history(session_id: str) -> List[Dict]:
         history = []
         for log in logs:
             history.append({"role": "user", "content": log.user_text})
-            history.append({
-                "role": "assistant",
-                "content": log.answer_text or "",
-                "contexts": log.contexts or [],
-            })
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": log.answer_text or "",
+                    "contexts": log.contexts or [],
+                }
+            )
         return history
     finally:
         db.close()
 
 
-def _render_date_filter_badge(meta: Dict):
-    """日付フィルタ状態をバッジ表示"""
-    date_filter = meta.get("date_filter")
-    if not date_filter:
-        return
-
-    start = date_filter.get("start", "")
-    end = date_filter.get("end", "")
-    date_str = start if start == end else f"{start} 〜 {end}"
-
-    if meta.get("date_filtered"):
-        st.markdown(f"📅 :green[**日付フィルタ適用中**: {date_str}]")
-    elif meta.get("date_no_match"):
-        st.markdown(f"⚠️ :orange[**日付該当なし**: {date_str}（全データから検索）]")
-
-
-def _render_context_chunks(contexts: List[Dict], max_display: Optional[int] = None, truncate: bool = False):
-    """参照チャンクを統一形式で表示"""
-    display_contexts = contexts[:max_display] if max_display else contexts
-
-    for idx, ctx in enumerate(display_contexts, start=1):
-        score_parts = [f"**総合スコア:** {ctx.get('score', 0):.3f}"]
-        if ctx.get("score_vector") is not None:
-            score_parts.append(f"ベクトル: {ctx['score_vector']:.3f}")
-        if ctx.get("score_fts") is not None:
-            score_parts.append(f"FTS: {ctx['score_fts']:.3f}")
-        score_str = " / ".join(score_parts)
-
-        meta_parts = []
-        if ctx.get("file_path"):
-            meta_parts.append(f"📁 {ctx['file_path']}")
-        if ctx.get("tag"):
-            meta_parts.append(f"🏷️ {ctx['tag']}")
-        if ctx.get("recorded_at"):
-            meta_parts.append(f"📅 {ctx['recorded_at']}")
-        meta_str = " / ".join(meta_parts) if meta_parts else ""
-
-        st.markdown(f"**{idx}.** {score_str}")
-        if meta_str:
-            st.caption(meta_str)
-
-        chunk_text = ctx.get("chunk_text", "")
-        if truncate and len(chunk_text) > 200:
-            st.text(chunk_text[:200] + "…")
-        else:
-            st.write(chunk_text)
-
-        st.divider()
-
-
-def _handle_rag_error(error: Exception, context: str = ""):
-    """RAGエラーの統一ハンドリング"""
-    error_msg = str(error)
-
-    if "OPENAI_API_KEY" in error_msg or "api_key" in error_msg.lower():
-        st.error("🔑 APIキーが設定されていないか無効です。環境変数を確認してください。")
-    elif "rate_limit" in error_msg.lower() or "429" in error_msg:
-        st.warning("⏳ APIのレート制限に達しました。しばらく待ってから再試行してください。")
-    elif "timeout" in error_msg.lower():
-        st.error("⏰ タイムアウトが発生しました。ネットワーク接続を確認してください。")
-    else:
-        st.error(f"❌ エラーが発生しました{': ' + context if context else ''}")
-        with st.expander("詳細を表示"):
-            st.code(error_msg)
-
-    logger.error(f"RAG error ({context}): {error}", exc_info=True)
-
-
-def _fetch_session_summaries(keyword: str = "", limit: int = 20):
-    """セッション一覧を取得（最終更新順）。"""
+def _fetch_session_summaries(profile: _ChatProfile, limit: int = 15):
     db = next(get_db())
     try:
-        session_ids_subq = None
-        if keyword:
-            session_ids_subq = (
-                db.query(RAGChatLog.session_id)
-                .filter(RAGChatLog.session_id.isnot(None))
-                .filter(
-                    or_(
-                        RAGChatLog.user_text.contains(keyword),
-                        RAGChatLog.answer_text.contains(keyword),
-                    )
-                )
-                .distinct()
-                .subquery()
-            )
-
         base = (
             db.query(
                 RAGChatLog.session_id.label("session_id"),
                 func.min(RAGChatLog.created_at).label("first_created"),
                 func.max(RAGChatLog.created_at).label("last_updated"),
-                func.count(RAGChatLog.id).label("message_count"),
             )
             .filter(RAGChatLog.session_id.isnot(None))
+            .filter(_kind_filter(profile))
+            .group_by(RAGChatLog.session_id)
+            .subquery()
         )
-        if session_ids_subq is not None:
-            base = base.filter(RAGChatLog.session_id.in_(select(session_ids_subq.c.session_id)))
-        base = base.group_by(RAGChatLog.session_id).subquery()
 
-        sessions = (
+        return (
             db.query(
                 base.c.session_id,
                 base.c.last_updated,
-                base.c.message_count,
                 RAGChatLog.user_text.label("first_question"),
             )
             .join(
@@ -162,239 +122,371 @@ def _fetch_session_summaries(keyword: str = "", limit: int = 20):
             .limit(limit)
             .all()
         )
-        return sessions
     finally:
         db.close()
 
 
-def run_rag_tab():
-    st.header("RAG検索（文字起こしQA）")
+def _render_session_picker(profile: _ChatProfile, session_id: str) -> None:
+    with st.popover("🗂 過去の会話", use_container_width=True):
+        sessions = _fetch_session_summaries(profile)
+        if not sessions:
+            st.caption("保存された会話はありません。")
+        for s in sessions:
+            title = (s.first_question or "（無題）").strip()
+            if len(title) > 26:
+                title = title[:26] + "…"
+            prefix = "▶ " if s.session_id == session_id else ""
+            updated = str(s.last_updated)[:10]  # YYYY-MM-DD
+            if st.button(
+                f"{prefix}{updated}　{title}",
+                key=f"rag_{profile.key}_resume_{s.session_id}",
+                use_container_width=True,
+            ):
+                st.session_state[f"rag_{profile.key}_session_id"] = s.session_id
+                st.session_state[f"rag_{profile.key}_history"] = _load_session_history(s.session_id)
+                st.rerun()
 
-    rag_service = get_rag_service()
 
-    if not rag_service.enabled:
-        if not USE_VECTOR:
-            st.warning(
-                "RAG機能を利用するには Turso(libSQL) のベクトル対応データベースを構成し、"
-                "audio_transcription_chunks に libsql_vector_idx を作成してください（自動作成済みでない場合）。"
-            )
-            st.info("ローカルの通常SQLiteではRAGは無効化されます。Tursoの `sqlite+libsql://` を使用してください。")
+# ----------------------------------------------------------------------
+# 表示部品
+# ----------------------------------------------------------------------
+def _render_context_docs(contexts: List[Dict]) -> None:
+    """参照した録音のカード表示。旧形式(chunk単位ログ)にも対応。"""
+    for ctx in contexts:
+        if "text" in ctx and "n" in ctx:  # 新形式(録音単位)
+            title = ctx.get("title") or "（不明なファイル）"
+            date_str = ctx.get("recorded_date") or "日付不明"
+            source = _SOURCE_LABELS.get(ctx.get("source"), "")
+            st.markdown(f"**[#{ctx['n']}] {date_str} — {title}**")
+            caps = []
+            if source:
+                caps.append(source)
+            if ctx.get("tags"):
+                caps.append(f"🏷️ {ctx['tags']}")
+            caps.append("全文" if ctx.get("is_full_text") else "関連部分の抜粋")
+            st.caption(" / ".join(caps))
+            body = ctx.get("text") or ""
+            if len(body) > 600:
+                st.text(body[:600] + f"…\n（表示は先頭600文字。使用したのは{len(body)}文字）")
+            else:
+                st.text(body)
+        else:  # 旧形式
+            st.markdown(f"**{ctx.get('file_path', '（不明）')}** — {ctx.get('recorded_at', '')}")
+            if ctx.get("score") is not None:
+                st.caption(f"スコア {ctx.get('score', 0):.3f}")
+            st.text((ctx.get("chunk_text") or "")[:400])
+        st.divider()
+
+
+def _render_search_badges(meta: Dict) -> None:
+    """検索時に適用された条件をバッジ表示する。"""
+    parts = []
+    date_filter = meta.get("date_filter")
+    if date_filter:
+        start, end = date_filter.get("start", ""), date_filter.get("end", "")
+        span = start if start == end else f"{start} 〜 {end}"
+        if date_filter.get("kind") == "recency":
+            parts.append(f"🕒 :blue[「{date_filter.get('matched_text', '最近')}」→ {span} を優先]")
+        elif date_filter.get("kind") == "manual":
+            parts.append(f"📅 :green[期間指定: {span}]")
         else:
-            st.warning(
-                "OPENAI_API_KEY が未設定、もしくは埋め込みモデル設定に問題があるためRAGが無効化されています。"
-            )
-            st.info("環境変数にOPENAI_API_KEYを設定し、必要に応じて EMBEDDING_MODEL / EMBEDDING_DIM を調整してください。")
+            parts.append(f"📅 :green[期間で絞り込み: {span}]")
+    coverage = meta.get("coverage")
+    if coverage:
+        parts.append(
+            f"📚 :gray[期間内{coverage['in_range']}件中、新しい順に{coverage['used']}件を参照]"
+        )
+    elif meta.get("mode") == "browse":
+        parts.append("📚 :gray[期間内の録音を新しい順に参照]")
+    if meta.get("mode") == "followup":
+        parts.append("🔁 :gray[前回の参照録音を再利用]")
+    if meta.get("fallback") == "recency_widened":
+        parts.append("⚠️ :orange[期間内にデータがないため全期間から検索]")
+    elif meta.get("fallback") == "quoted_term_widened":
+        term = meta.get("widened_term") or ""
+        parts.append(f"⚠️ :orange[「{term}」が期間内に見つからないため全期間から検索]")
+    if parts:
+        st.markdown("  ".join(parts))
+
+
+def _handle_rag_error(error: Exception, context: str = ""):
+    error_msg = str(error)
+    if "OPENAI_API_KEY" in error_msg or "api_key" in error_msg.lower():
+        st.error("🔑 APIキーが設定されていないか無効です。環境変数を確認してください。")
+    elif "rate_limit" in error_msg.lower() or "429" in error_msg:
+        st.warning("⏳ APIのレート制限に達しました。しばらく待ってから再試行してください。")
+    else:
+        st.error(f"❌ エラーが発生しました{': ' + context if context else ''}")
+        with st.expander("詳細を表示"):
+            st.code(error_msg)
+    logger.error(f"RAG error ({context}): {error}", exc_info=True)
+
+
+# ----------------------------------------------------------------------
+# インデックス状態
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def _corpus_snapshot() -> Tuple[Dict, Dict]:
+    """コーパス統計と未索引件数。タブ2つ分の再照会を防ぐため30秒キャッシュする。"""
+    rag = get_rag_service()
+    db = next(get_db())
+    try:
+        return rag.corpus_stats(db), rag.pending_counts(db)
+    finally:
+        db.close()
+
+
+def _ensure_index(rag, profile: _ChatProfile, pending: Dict[str, int]) -> None:
+    """索引の差分を検出し、軽い処理は自動で、重い処理は明示実行で補完する。
+
+    デスクトップ版などWeb以外の経路で保存されたデータもここで検索対象に取り込む。
+    _AUTO_INDEX_LIMIT件以下なら開いたときに自動実行するため、通常運用では
+    ユーザー操作なしで新しいデータが検索できるようになる。
+    """
+    if "rag_light_reconciled" not in st.session_state:
+        db = next(get_db())
+        try:
+            rag.reconcile(db, embed=False)
+            st.session_state.rag_light_reconciled = True
+        except Exception as exc:
+            logger.warning("軽量再同期に失敗: %s", exc)
+        finally:
+            db.close()
+
+    total = sum(pending.values())
+    if total == 0:
         return
 
-    # セッション管理
-    session_id = _get_or_create_session_id()
+    def _run_indexing():
+        db2 = next(get_db())
+        try:
+            with st.status(f"未登録の録音 {total}件をインデックス化しています…", expanded=True) as status:
+                bar = st.progress(0.0)
+                def cb(done, all_count, label):
+                    bar.progress(min(1.0, done / max(1, all_count)), text=f"{done}/{all_count} 件 ({label})")
+                report = rag.reconcile(db2, embed=True, progress_cb=cb)
+                ok = sum(report.get("indexed", {}).values())
+                errs = report.get("errors", 0)
+                status.update(
+                    label=f"インデックス化が完了しました（成功 {ok}件 / 失敗 {errs}件）",
+                    state="complete" if errs == 0 else "error",
+                    expanded=False,
+                )
+        finally:
+            db2.close()
+        _corpus_snapshot.clear()
+        st.rerun()
 
-    if "rag_history" not in st.session_state:
-        st.session_state.rag_history = []
+    if total <= _AUTO_INDEX_LIMIT:
+        _run_indexing()
+    else:
+        st.warning(
+            f"⚠️ **{total}件の録音が検索インデックスに未登録です**"
+            f"（現場録音 {pending.get('audio', 0)}件 / 社長音声 {pending.get('ceo', 0)}件）。"
+            "デスクトップ版で保存されたデータや、検索エンジンの更新"
+            "（埋め込みモデル変更）による再作成分が該当します。"
+            "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
+        )
+        if st.button(
+            f"今すぐインデックス化する（約{max(1, total // 100)}〜{max(2, total // 50)}分）",
+            type="primary",
+            key=f"rag_{profile.key}_reindex_btn",
+        ):
+            _run_indexing()
 
-    # --- セッション管理UI ---
-    session_cols = st.columns([2, 1, 1])
-    with session_cols[0]:
-        st.caption(f"セッションID: {session_id[:8]}...")
-    with session_cols[1]:
-        if st.button("新規セッション", use_container_width=True, help="新しい会話を開始"):
-            st.session_state.rag_session_id = str(uuid.uuid4())
-            st.session_state.rag_history = []
+
+# ----------------------------------------------------------------------
+# メイン
+# ----------------------------------------------------------------------
+def run_rag_tab():
+    """現場録音への質問タブ。"""
+    _run_chat(_AUDIO_PROFILE)
+
+
+def run_ceo_rag_tab():
+    """社長音声への質問タブ。"""
+    _run_chat(_CEO_PROFILE)
+
+
+def _run_chat(profile: _ChatProfile):
+    st.header(profile.header)
+
+    rag = get_rag_service()
+
+    if not rag.enabled:
+        if not USE_VECTOR:
+            st.warning(
+                "この機能には Turso(libSQL) データベースが必要です。"
+                "`DATABASE_URL` に `sqlite+libsql://...` を設定してください（ローカルSQLiteでは無効）。"
+            )
+        else:
+            st.warning("OPENAI_API_KEY が未設定のためQA検索を利用できません。")
+        return
+
+    session_id = _get_or_create_session_id(profile)
+    hist_key = f"rag_{profile.key}_history"
+    if hist_key not in st.session_state:
+        st.session_state[hist_key] = []
+
+    # --- コーパス統計と索引状態 ---
+    stats, pending = _corpus_snapshot()
+    src = profile.sources[0]
+    s = stats.get(src, {})
+    st.caption(
+        f"検索対象: {_SOURCE_LABELS[src]} **{s.get('count', 0)}件**"
+        f"（最新の録音日 {s.get('latest') or '—'}）"
+    )
+
+    _ensure_index(rag, profile, pending)
+
+    # --- 検索条件 ---
+    ctrl_cols = st.columns([1.8, 1.1, 1.1])
+    manual_range: Optional[Tuple[date, date]] = None
+    with ctrl_cols[0]:
+        d_from = st.session_state.get(f"rag_{profile.key}_date_from")
+        d_to = st.session_state.get(f"rag_{profile.key}_date_to")
+        period_label = (
+            f"📅 {d_from} 〜 {d_to}" if (d_from and d_to) else "📅 期間: 自動判定"
+        )
+        with st.popover(period_label, use_container_width=True):
+            st.caption("通常は質問文から自動判定します（「7/28の作業」「先月の記録」等）。固定したい場合のみ指定してください。")
+            c1, c2 = st.columns(2)
+            with c1:
+                d_from = st.date_input(
+                    "開始日", value=d_from, key=f"rag_{profile.key}_date_from_input", format="YYYY-MM-DD"
+                )
+            with c2:
+                d_to = st.date_input(
+                    "終了日", value=d_to, key=f"rag_{profile.key}_date_to_input", format="YYYY-MM-DD"
+                )
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("適用", use_container_width=True, key=f"rag_{profile.key}_date_apply"):
+                    st.session_state[f"rag_{profile.key}_date_from"] = d_from
+                    st.session_state[f"rag_{profile.key}_date_to"] = d_to
+                    st.rerun()
+            with b2:
+                if st.button("解除（自動に戻す）", use_container_width=True, key=f"rag_{profile.key}_date_clear"):
+                    st.session_state[f"rag_{profile.key}_date_from"] = None
+                    st.session_state[f"rag_{profile.key}_date_to"] = None
+                    st.rerun()
+        if st.session_state.get(f"rag_{profile.key}_date_from") and st.session_state.get(f"rag_{profile.key}_date_to"):
+            manual_range = (
+                st.session_state[f"rag_{profile.key}_date_from"],
+                st.session_state[f"rag_{profile.key}_date_to"],
+            )
+    with ctrl_cols[1]:
+        if st.button("✨ 新規会話", use_container_width=True, key=f"rag_{profile.key}_new_session"):
+            st.session_state[f"rag_{profile.key}_session_id"] = str(uuid.uuid4())
+            st.session_state[hist_key] = []
             st.rerun()
-    with session_cols[2]:
-        if st.button("履歴クリア", use_container_width=True, help="現在の会話履歴をクリア"):
-            st.session_state.rag_history = []
-            st.rerun()
+    with ctrl_cols[2]:
+        _render_session_picker(profile, session_id)
 
-    # --- 高度な設定 ---
-    default_alpha = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))
-    default_retrieval_k = int(os.getenv("RAG_RETRIEVAL_K", "100"))
-    default_context_k = int(os.getenv("RAG_CONTEXT_MAX_CHUNKS", "12"))
-
-    with st.expander("🔧 検索設定", expanded=False):
-        st.caption("検索は全データから上位候補を自動抽出します。実行中にタブを切り替えると処理が中断されることがあります。")
-
-        setting_cols = st.columns(2)
-        with setting_cols[0]:
-            use_hybrid = st.checkbox(
-                "ハイブリッド検索 (FTS×ベクトル)",
-                value=True,
-                help="FTS（全文検索）とベクトル検索を併用",
-            )
-            alpha = st.slider(
-                "ベクトル重み α",
-                min_value=0.0,
-                max_value=1.0,
-                value=default_alpha,
-                step=0.05,
-                help="1.0=ベクトルのみ、0.0=FTSのみ",
-            )
-        with setting_cols[1]:
-            retrieval_k = st.number_input(
-                "検索候補上限",
-                min_value=10,
-                max_value=200,
-                value=default_retrieval_k,
-                step=10,
-                help="検索候補の母集団サイズ",
-            )
-            context_k = st.number_input(
-                "使用チャンク上限",
-                min_value=3,
-                max_value=30,
-                value=default_context_k,
-                step=1,
-                help="プロンプトに含めるチャンク数の上限",
-            )
-
-    for message in st.session_state.rag_history:
+    # --- 会話履歴表示 ---
+    for message in st.session_state[hist_key]:
         block = st.chat_message(message["role"])
         if message["role"] == "user":
             block.markdown(highlight_date_in_query(message["content"]))
         else:
             block.markdown(message["content"])
-        if message["role"] == "assistant" and message.get("contexts"):
-            with block.expander("参照したチャンク", expanded=False):
-                _render_context_chunks(message["contexts"])
+            if message.get("contexts"):
+                with block.expander(f"参照した録音（{len(message['contexts'])}件）", expanded=False):
+                    _render_context_docs(message["contexts"])
 
-    query = st.chat_input("文字起こしデータへの質問を入力してください（例: 「昨日の会議について」「12月3日の打ち合わせ内容」）")
+    query = st.chat_input(profile.placeholder, key=f"rag_{profile.key}_chat_input")
+    if not query:
+        return
 
-    if query:
-        st.session_state.rag_history.append({"role": "user", "content": query})
-        # 日付部分をハイライトして表示
-        st.chat_message("user").markdown(highlight_date_in_query(query))
+    st.session_state[hist_key].append({"role": "user", "content": query})
+    st.chat_message("user").markdown(highlight_date_in_query(query))
 
-        # 会話履歴を構築（現在の質問は除外）
-        chat_history_for_rag = [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in st.session_state.rag_history[:-1]  # 最後の質問は除外
-            if msg["role"] in ("user", "assistant") and msg.get("content")
-        ]
+    chat_history_for_rag = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state[hist_key][:-1]
+        if m["role"] in ("user", "assistant") and m.get("content")
+    ]
+    # 直前の回答で参照した録音(「表形式で」等の追問時に再検索せず再利用する)
+    previous_docs = next(
+        (
+            m.get("contexts")
+            for m in reversed(st.session_state[hist_key][:-1])
+            if m.get("role") == "assistant" and m.get("contexts")
+        ),
+        None,
+    )
 
-        # ストリーミング実行
-        with st.spinner("検索を実行中..."):
-            db = next(get_db())
-            try:
-                result2 = rag_service.answer_stream(
-                    db,
-                    query,
-                    top_k=retrieval_k,
-                    hybrid=use_hybrid,
-                    alpha=alpha,
-                    context_k=context_k,
-                    chat_history=chat_history_for_rag,
-                )
-            except Exception as e:
-                _handle_rag_error(e, "検索実行")
-                db.close()
-                return
-            finally:
-                db.close()
+    with st.spinner("音声DBを検索中…"):
+        db = next(get_db())
+        try:
+            result = rag.answer_stream(
+                db,
+                query,
+                sources=profile.sources,
+                manual_date_range=manual_range,
+                chat_history=chat_history_for_rag,
+                previous_docs=previous_docs,
+            )
+        except Exception as e:
+            _handle_rag_error(e, "検索実行")
+            db.close()
+            return
+        finally:
+            db.close()
 
-        matches = result2.get("matches", [])
-        meta = result2.get("meta") or {}
-        stream_fn = result2.get("stream_fn")
+    docs = result.get("docs", [])
+    meta = result.get("meta") or {}
+    stream_fn = result.get("stream_fn")
 
-        # 日付フィルタバッジを先に表示
-        _render_date_filter_badge(meta)
+    _render_search_badges(meta)
 
-        # ストリーミング表示
-        with st.chat_message("assistant"):
-            tgen0 = time.time()
-            try:
-                full_text = st.write_stream(stream_fn()) if callable(stream_fn) else ""
-            except Exception as e:
-                acc = ""
-                placeholder = st.empty()
-                try:
-                    for chunk in (stream_fn() if callable(stream_fn) else []):
-                        acc += str(chunk)
-                        placeholder.markdown(acc)
-                    full_text = acc
-                except Exception as inner_e:
-                    _handle_rag_error(inner_e, "ストリーミング出力")
-                    full_text = ""
-            tgen1 = time.time()
+    with st.chat_message("assistant"):
+        try:
+            full_text = st.write_stream(stream_fn()) if callable(stream_fn) else ""
+        except Exception as e:
+            _handle_rag_error(e, "回答生成")
+            full_text = ""
 
-            # 参照チャンク表示（共通コンポーネント使用）
-            if matches:
-                with st.expander("参照したチャンク", expanded=False):
-                    _render_context_chunks(matches)
+        if docs:
+            with st.expander(f"参照した録音（{len(docs)}件）", expanded=False):
+                _render_context_docs(docs)
 
-        # メタ情報（秒単位、日付情報は上部バッジに移動）
-        timings = (meta.get("timings_ms") or {}) if isinstance(meta, dict) else {}
-        retrieval_s = (timings.get("retrieval") or 0) / 1000.0
-        prompt_s = (timings.get("prompt_build") or 0) / 1000.0
-        gen_s = (tgen1 - tgen0)
-        total_s = retrieval_s + prompt_s + gen_s
-        cap = f"候補: {meta.get('candidates')} / 使用: {meta.get('used_context_chunks')} 件"
-        cap += f" / 検索: {retrieval_s:.3f}s / 生成: {gen_s:.3f}s / 合計: {total_s:.3f}s"
-        st.caption(cap)
+    # --- 履歴・ログ保存 ---
+    st.session_state[hist_key].append(
+        {"role": "assistant", "content": full_text, "contexts": docs}
+    )
 
-        # 履歴・DB保存
-        st.session_state.rag_history.append(
-            {"role": "assistant", "content": full_text, "contexts": matches}
+    def _json_default(o):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return str(o)
+
+    # ログにはコンテキスト全文ではなく先頭部分のみ保存(肥大化防止)
+    log_docs = []
+    for d in docs:
+        dd = dict(d)
+        if isinstance(dd.get("text"), str) and len(dd["text"]) > 1500:
+            dd["text"] = dd["text"][:1500] + "…"
+        log_docs.append(dd)
+    contexts_json = json.loads(json.dumps(log_docs, default=_json_default))
+
+    db2 = next(get_db())
+    try:
+        log = RAGChatLog(
+            session_id=session_id,
+            chat_kind=profile.key,
+            user_text=query,
+            answer_text=full_text,
+            contexts=contexts_json,
+            used_hybrid=True,
+            alpha=None,  # UI設定を廃止(既定値RAG_HYBRID_ALPHAで動作)
+            date_filter_applied=bool(meta.get("date_filter")),
         )
-
-        def _json_default(o):
-            if isinstance(o, (datetime, date)):
-                return o.isoformat()
-            return str(o)
-
-        contexts_json = json.loads(json.dumps(matches, default=_json_default))
-
-        with st.spinner("チャットを保存中..."):
-            db2 = next(get_db())
-            try:
-                date_filter = meta.get("date_filter")
-                log = RAGChatLog(
-                    session_id=session_id,
-                    user_text=query,
-                    answer_text=full_text,
-                    contexts=contexts_json,
-                    used_hybrid=bool(use_hybrid),
-                    alpha=float(alpha) if alpha is not None else None,
-                    date_filter_applied=bool(meta.get("date_filtered")) if date_filter else False,
-                )
-                db2.add(log)
-                db2.commit()
-            except Exception as e:
-                db2.rollback()
-                logger.error(f"チャット保存エラー: {e}")
-                st.warning("チャットの保存に失敗しました。ログをご確認ください。")
-            finally:
-                db2.close()
-
-    # --- セッション履歴 ---
-    st.divider()
-    st.subheader("セッション履歴")
-
-    colh1, colh2 = st.columns([2, 1])
-    with colh1:
-        kw = st.text_input(
-            "キーワード（セッション内の質問/回答を対象）",
-            value="",
-            placeholder="例: 契約 期限",
-        )
-    with colh2:
-        session_limit = st.slider("表示件数", min_value=5, max_value=50, value=20, step=5)
-
-    sessions = _fetch_session_summaries(keyword=kw, limit=session_limit)
-
-    if not sessions:
-        st.info("保存されたセッションがありません。検索/質問後にここへ表示されます。")
-    else:
-        for s in sessions:
-            title = (s.first_question or "").strip()
-            if not title:
-                title = "（無題）"
-            if len(title) > 40:
-                title = title[:40] + "…"
-            label = f"[{s.last_updated}] {title}"
-            if s.session_id == session_id:
-                label = f"▶ {label}"
-            if st.button(label, key=f"resume_{s.session_id}", use_container_width=True):
-                st.session_state.rag_session_id = s.session_id
-                st.session_state.rag_history = _load_session_history(s.session_id)
-                st.rerun()
-            st.caption(f"{s.message_count}件のメッセージ")
+        db2.add(log)
+        db2.commit()
+    except Exception as e:
+        db2.rollback()
+        logger.error(f"チャット保存エラー: {e}")
+        st.warning("チャットの保存に失敗しました。")
+    finally:
+        db2.close()

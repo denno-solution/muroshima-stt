@@ -13,6 +13,16 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> Iterable[str]:
     if not sentences:
         sentences = [text.strip()]
 
+    # 句点のない長文(擬音注記の連続等)が巨大チャンク化して埋め込みAPIの
+    # トークン上限を超えないよう、chunk_sizeを超える文は強制分割する
+    bounded: List[str] = []
+    for s in sentences:
+        if len(s) <= chunk_size:
+            bounded.append(s)
+        else:
+            bounded.extend(s[i : i + chunk_size] for i in range(0, len(s), chunk_size))
+    sentences = bounded
+
     chunks: List[str] = []
     current: List[str] = []
     current_length = 0

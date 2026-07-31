@@ -26,6 +26,7 @@ from sqlalchemy import or_
 
 from models import CeoTranscription, get_db
 from services.audio_utils import get_audio_duration, get_audio_duration_metadata
+from services.rag_service import get_rag_service
 from services.vad import trim_non_speech
 from stt_wrapper import STTModelWrapper
 
@@ -509,6 +510,16 @@ def process_ceo_uploaded_path(
                 created_at=datetime.now(),
             )
             db.add(record)
+            db.flush()
+
+            # 保存と同時に検索インデックスへ登録(失敗しても保存自体は成立させる)
+            rag = get_rag_service()
+            if rag.enabled:
+                try:
+                    rag.index_ceo_transcription(db, record.id, transcription)
+                except Exception as exc:
+                    logger.error("社長音声のRAG索引作成に失敗: %s", exc, exc_info=True)
+
             db.commit()
             db.refresh(record)
             result.record_id = record.id

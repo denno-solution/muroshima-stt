@@ -1,101 +1,85 @@
+"""回答生成用プロンプトの組み立て(Responses API形式)。"""
+
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from typing import Dict, List, Optional
 
+from services.rag.context_builder import ContextDoc
 
-def build_prompt(query: str, matches: List[Dict]) -> str:
-    """非チャット形式の回答用プロンプトを生成。"""
-    numbered_context = []
-    for i, match in enumerate(matches, start=1):
-        meta_parts = []
-        if match.get("file_path"):
-            meta_parts.append(f"ファイル: {match['file_path']}")
-        if match.get("tag"):
-            meta_parts.append(f"タグ: {match['tag']}")
-        if match.get("recorded_at"):
-            meta_parts.append(f"録音時刻: {match['recorded_at']}")
-        meta = " / ".join(meta_parts)
-        header = f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
-        numbered_context.append(f"{header}\n{match['chunk_text']}")
+_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
 
-    context_block = "\n\n".join(numbered_context)
 
-    instructions = (
-        "あなたは社内の音声文字起こしデータを根拠に回答する日本語アシスタントです。"
-        "事実は必ず下のコンテキスト内から根拠を取り、出典として [#番号] を示してください。"
-        "根拠が完全には揃わない場合でも、\"分かっていること\"と\"不足情報\"を分けて簡潔に答えてください。"
-        "日付や時刻は可能なら YYYY-MM-DD 形式で明示してください。"
-    )
+_CORPUS_DESCRIPTIONS = {
+    "audio": "現場の作業録音を文字起こしした「音声DB」",
+    "ceo": "社長が録音した音声メモ・打ち合わせを文字起こしした「社長音声DB」",
+}
 
-    output_format = (
-        "出力は次の3セクションで返してください:\n"
-        "1) 回答:\n- 箇条書きで要点のみ（最大5項目）。\n"
-        "2) 根拠:\n- 参照した [#番号] と短い引用/要約（1〜3件）。\n"
-        "3) 不足情報/前提:\n- 追加で必要な情報や不確実な点。"
-    )
 
+def build_system_prompt(today: Optional[date] = None, corpus: str = "audio") -> str:
+    today_str = (today or date.today()).isoformat()
+    corpus_desc = _CORPUS_DESCRIPTIONS.get(corpus, _CORPUS_DESCRIPTIONS["audio"])
     return (
-        f"{instructions}\n\n"
-        f"コンテキスト（番号付き）:\n{context_block}\n\n"
-        f"質問:\n{query}\n\n"
-        f"{output_format}"
+        "あなたは射出成形工場の社内アシスタントです。"
+        f"{corpus_desc}から検索した内容(コンテキスト)に基づいて質問に答えます。\n"
+        f"今日の日付: {today_str}\n"
+        "ルール:\n"
+        "- 事実は必ずコンテキストに基づき、該当する録音番号 [#n] を出典として示す\n"
+        "- コンテキストは音声の自動文字起こしのため、誤変換や言い淀みが含まれうる。文脈から明らかな誤変換は補って解釈してよいが、推測した場合はその旨を付記する\n"
+        "- 回答の形式は質問の指定に従う(表形式・報告書形式など)。指定がなければ簡潔な箇条書き\n"
+        "- 日付は YYYY-MM-DD 形式で明示する\n"
+        "- コンテキストに根拠がない事項は推測せず、「記録には見つからない」と正直に述べる\n"
+        "- 会話の文脈を維持し、直前のやり取りとの関連を保つ"
     )
 
 
-def build_chat_prompt(
+def format_context_block(docs: List[ContextDoc]) -> str:
+    blocks: List[str] = []
+    for d in docs:
+        meta_parts = [f"録音: {d.title}"]
+        if d.recorded_date:
+            meta_parts.append(f"録音日: {d.recorded_date}")
+        if d.tags:
+            meta_parts.append(f"タグ: {d.tags}")
+        meta_parts.append(_SOURCE_LABELS.get(d.source, d.source))
+        if not d.is_full_text:
+            meta_parts.append("※関連部分の抜粋")
+        header = f"[#{d.n}] " + " / ".join(meta_parts)
+        blocks.append(f"{header}\n{d.text}")
+    return "\n\n".join(blocks)
+
+
+def build_chat_messages(
     query: str,
-    matches: List[Dict],
+    docs: List[ContextDoc],
     chat_history: Optional[List[Dict]] = None,
+    today: Optional[date] = None,
+    corpus: str = "audio",
+    notes: Optional[List[str]] = None,
 ) -> List[Dict]:
-    """会話履歴込みのプロンプト（Responses API形式）。"""
-    numbered_context = []
-    for i, match in enumerate(matches, start=1):
-        meta_parts = []
-        if match.get("file_path"):
-            meta_parts.append(f"ファイル: {match['file_path']}")
-        if match.get("tag"):
-            meta_parts.append(f"タグ: {match['tag']}")
-        if match.get("recorded_at"):
-            recorded = match["recorded_at"]
-            if isinstance(recorded, datetime):
-                recorded = recorded.strftime("%Y-%m-%d %H:%M")
-            elif isinstance(recorded, date):
-                recorded = recorded.strftime("%Y-%m-%d")
-            meta_parts.append(f"録音日時: {recorded}")
-        meta = " / ".join(meta_parts)
-        header = f"[#{i} スコア:{match['score']:.3f}] {meta}" if meta else f"[#{i} スコア:{match['score']:.3f}]"
-        numbered_context.append(f"{header}\n{match['chunk_text']}")
+    """回答生成用メッセージ列を組み立てる。
 
-    context_block = "\n\n".join(numbered_context)
-
-    system_content = (
-        "あなたはRAGベースの社内QAアシスタントです。"
-        "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
-        "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
-        "文体は簡潔で日本語、箇条書きを優先します。"
-        "会話の文脈を維持し、前の質問への回答と関連付けて答えてください。"
-    )
-
-    messages = [{"role": "system", "content": system_content}]
+    notesには検索システム側の補足(期間拡大した・期間内の一部のみ参照している等)を
+    渡す。モデルがコンテキストの範囲を誤解して「日付が矛盾する」等と混乱するのを防ぐ。
+    """
+    messages: List[Dict] = [{"role": "system", "content": build_system_prompt(today, corpus)}]
 
     if chat_history:
-        recent_history = chat_history[-10:]
-        for msg in recent_history:
+        for msg in chat_history[-10:]:
             role = msg.get("role")
             content = msg.get("content", "")
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
 
+    notes_block = ""
+    if notes:
+        notes_block = "検索システムからの補足:\n" + "\n".join(f"- {n}" for n in notes) + "\n\n"
+
     user_prompt = (
-        f"以下のコンテキスト（番号付き）を参照して質問に答えてください。\n\n"
-        f"コンテキスト:\n{context_block}\n\n"
-        f"質問:\n{query}\n\n"
-        f"出力は次の3セクションで返してください:\n"
-        f"1) 回答: 箇条書きで要点のみ（最大5項目）。\n"
-        f"2) 根拠: 参照した [#番号] と短い引用/要約（1〜3件）。\n"
-        f"3) 不足情報/前提: 追加で必要な情報や不確実な点。"
+        "以下は音声DBから検索した録音の文字起こしです。これに基づいて質問に答えてください。\n\n"
+        f"{notes_block}"
+        f"{format_context_block(docs)}\n\n"
+        f"質問:\n{query}"
     )
     messages.append({"role": "user", "content": user_prompt})
-
     return messages

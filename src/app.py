@@ -9,7 +9,7 @@ from ui.tabs.upload_tab import run_upload_tab
 from ui.tabs.mic_tab import run_mic_tab
 from ui.tabs.results_tab import run_results_tab
 from ui.tabs.db_tab import run_db_tab
-from ui.tabs.rag_tab import run_rag_tab
+from ui.tabs.rag_tab import run_ceo_rag_tab, run_rag_tab
 from ui.tabs.ceo_tab import run_ceo_tab
 from ui.tabs.ceo_db_tab import run_ceo_db_tab
 # .envファイルを読み込む
@@ -79,14 +79,15 @@ st.session_state.settings = settings
 with st.sidebar:
     selected_model, use_structuring, debug_mode = build_sidebar(settings, log_dir, logger)
 
-tab1, tab2, tab_ceo, tab3, tab4, tab_ceo_db, tab5 = st.tabs([
+tab1, tab2, tab_ceo, tab3, tab4, tab_ceo_db, tab5, tab_ceo_rag = st.tabs([
     "📤 アップロード",
     "🎙️ マイク録音",
     "🎤 社長音声",
     "📊 処理結果",
     "🗄️ データベース",
     "📂 社長音声履歴",
-    "💬 QA検索",
+    "💬 現場録音に質問",
+    "💬 社長音声に質問",
 ])
 with tab1:
     run_upload_tab(selected_model, use_structuring, logger)
@@ -102,6 +103,8 @@ with tab_ceo_db:
     run_ceo_db_tab()
 with tab5:
     run_rag_tab()
+with tab_ceo_rag:
+    run_ceo_rag_tab()
 
 # フッター
 st.divider()

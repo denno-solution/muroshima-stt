@@ -1,60 +1,99 @@
-"""RAG向けの埋め込み生成と保存ロジック。Turso(libSQL)専用。"""
+"""RAGオーケストレーション。Turso(libSQL)専用。
+
+検索実行はservices/rag/search_service.py、索引の再同期はservices/rag/reconcile.py、
+コンテキスト組み立てはservices/rag/context_builder.pyに分離している。
+Phase 2(agentic search)ではSearchServiceの各メソッドをLLMのツールとして
+公開する想定。
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from models import (
-    AudioTranscription,
     AudioTranscriptionChunk,
+    CeoTranscriptionChunk,
     EMBEDDING_DIM,
-    LIBSQL_VECTOR_INDEX_NAME,
+    RAG_FTS_TABLES,
     USE_VECTOR,
-    VECTOR_BACKEND,
 )
-from services.rag import (
-    LibsqlRetriever,
-    chunk_text,
-    filter_matches_by_date,
-    parse_date_from_query,
-    build_chat_prompt,
+from sqlalchemy import text as sql_text
+
+from services.rag import chunk_text
+from services.rag.context_builder import ContextDoc, build_context_docs
+from services.rag.date_utils import DateRange, parse_date_from_query
+from services.rag.prompt_builder import build_chat_messages
+from services.rag.query_cleaner import (
+    build_match_query,
+    expand_synonyms,
+    has_content_keywords,
+    is_followup,
+    strip_instructions,
+    wants_aggregate,
 )
+from services.rag.reconcile import (
+    JST,
+    cleanup_orphan_chunks,
+    fill_recorded_dates,
+    find_unindexed,
+    normalize_to_jst_date,
+    set_index_meta,
+    sync_fts,
+)
+from services.rag.search_service import SearchFilters, SearchService
+from services.rag.tokenizer import fts_query_exact, to_fts_text
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "600"))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-# Responses API 対応モデルを既定に。
+# 既定はtext-embedding-3-large(dimensions=1536で既存スキーマのまま)。
+# prod実データ評価でベクトル検索のnDCG@6が0.33→0.55に改善したため引き上げた。
+# モデル変更時はrag_index_metaのマーカー不一致で全録音が自動的に再索引対象になる。
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
 COMPLETION_MODEL = os.getenv("RAG_COMPLETION_MODEL", "gpt-5.6-luna")
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in {"1", "true", "yes", "on"}
 
-# Hybrid search parameters
-HYBRID_DEFAULT_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))  # ベクトル寄り
-HYBRID_CAND_MULT = int(os.getenv("RAG_HYBRID_CAND_MULT", "3"))  # 候補母集団の拡大係数
-ENABLE_FTS = os.getenv("ENABLE_FTS", "true").lower() in {"1", "true", "yes", "on"}
-
-# Prompt safety limits（環境変数で調整可能）
-CONTEXT_MAX_CHUNKS = int(os.getenv("RAG_CONTEXT_MAX_CHUNKS", "12"))
-CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONTEXT_MAX_CHARS", "20000"))  # おおよそ数千トークン相当
-
-# Retrieval breadth（検索候補の母集団サイズ）。インデックスは常に全体を対象に上位を返します。
+# ベクトル側の重み。prod実データ評価ではキーワード(FTS)側が強く、
+# 0.6ではハイブリッドがFTS単独に負けたため0.4に引き下げた。
+HYBRID_DEFAULT_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.4"))
 RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "100"))
+
+# コンテキストは録音単位で組み立てる。期間ブラウズ・集約系の質問では
+# AGGREGATE_MAX_DOCSまで件数を広げ、1件あたりを薄く読む(網羅性優先)。
+CONTEXT_MAX_DOCS = int(os.getenv("RAG_CONTEXT_MAX_DOCS", "6"))
+AGGREGATE_MAX_DOCS = int(os.getenv("RAG_AGGREGATE_MAX_DOCS", "30"))
+CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONTEXT_MAX_CHARS", "40000"))
+WHOLE_DOC_THRESHOLD = int(os.getenv("RAG_WHOLE_DOC_THRESHOLD", "4000"))
+AGGREGATE_MIN_DOC_CHARS = 1200
+
+
+@dataclass
+class SearchPlan:
+    query: str
+    retrieval_text: str  # 埋め込み用テキスト(指示語除去+同義語付与済み)
+    match_query: Optional[str]  # FTS5クエリ(内容語のみ+同義語展開)
+    date_range: Optional[DateRange]
+    mode: str  # "search" | "browse" | "followup"
+    sources: Tuple[str, ...]
+    aggregate: bool = False  # 「まとめて」等、期間内を広く読むべき質問か
 
 
 class RAGService:
-    """埋め込み管理と検索ロジック。Turso(libSQL)専用で動作。"""
+    """埋め込み生成・索引管理・検索・回答生成のオーケストレーター。"""
 
     def __init__(self) -> None:
         self._enabled = bool(USE_VECTOR) and ENABLE_RAG
-        self._vector_backend = VECTOR_BACKEND
-        self._retriever = LibsqlRetriever(LIBSQL_VECTOR_INDEX_NAME)
+        self._search = SearchService()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             if self._enabled:
@@ -66,106 +105,562 @@ class RAGService:
     def enabled(self) -> bool:
         return self._enabled
 
-    def index_transcription(self, db: Session, transcription_id: int, text: str) -> None:
-        """文字起こし全文をチャンク化して埋め込みを保存。"""
+    @property
+    def search(self) -> SearchService:
+        return self._search
 
+    # ------------------------------------------------------------------
+    # 索引作成
+    # ------------------------------------------------------------------
+    def index_transcription(self, db: Session, transcription_id: int, text: str) -> bool:
+        """現場録音の文字起こしをチャンク化して索引に登録する。"""
+        return self._index_generic(db, "audio", transcription_id, text)
+
+    def index_ceo_transcription(self, db: Session, transcription_id: int, text: str) -> bool:
+        """社長音声の文字起こしを索引に登録する。"""
+        return self._index_generic(db, "ceo", transcription_id, text)
+
+    def _index_generic(self, db: Session, source: str, transcription_id: int, text: str) -> bool:
         if not self.enabled:
-            return
+            return False
+
+        chunk_model = AudioTranscriptionChunk if source == "audio" else CeoTranscriptionChunk
+        fts = RAG_FTS_TABLES[source]
 
         chunks = list(chunk_text(text, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP))
         if not chunks:
-            logger.debug("RAG: チャンクなしのためスキップ (transcription_id=%s)", transcription_id)
-            return
+            logger.debug("RAG: チャンクなしのためスキップ (%s id=%s)", source, transcription_id)
+            return False
 
         embeddings = self._embed_texts(chunks)
-        if not embeddings:
-            logger.warning("RAG: 埋め込み生成に失敗したためスキップ (transcription_id=%s)", transcription_id)
-            return
+        if not embeddings or len(embeddings) != len(chunks):
+            logger.warning("RAG: 埋め込み生成に失敗したためスキップ (%s id=%s)", source, transcription_id)
+            return False
 
-        # 既存チャンクを削除してから再作成
-        db.query(AudioTranscriptionChunk).filter_by(transcription_id=transcription_id).delete()
+        # recorded_dateの補完(ORMロードは不正JSON列で失敗しうるため生SQL)
+        parent_table = "audio_transcriptions" if source == "audio" else "ceo_transcriptions"
+        date_source_col = "recorded_at" if source == "ceo" else "created_at"
+        row = db.execute(
+            sql_text(
+                f"SELECT recorded_date, {date_source_col}, created_at FROM {parent_table} WHERE id = :id"
+            ),
+            {"id": transcription_id},
+        ).first()
+        if row is not None and not row[0]:
+            recorded_date = (
+                normalize_to_jst_date(row[1])
+                or normalize_to_jst_date(row[2])
+                or datetime.now(JST).strftime("%Y-%m-%d")
+            )
+            db.execute(
+                sql_text(f"UPDATE {parent_table} SET recorded_date = :d WHERE id = :id"),
+                {"d": recorded_date, "id": transcription_id},
+            )
 
-        for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
-            chunk = AudioTranscriptionChunk(
+        # 既存チャンク+FTS行を削除してから再作成
+        old_ids = [
+            r[0]
+            for r in db.query(chunk_model.id).filter_by(transcription_id=transcription_id).all()
+        ]
+        for cid in old_ids:
+            db.execute(sql_text(f"DELETE FROM {fts} WHERE rowid = :id"), {"id": cid})
+        db.query(chunk_model).filter_by(transcription_id=transcription_id).delete()
+
+        new_chunks = []
+        for idx, (piece, embedding) in enumerate(zip(chunks, embeddings)):
+            chunk = chunk_model(
                 transcription_id=transcription_id,
                 chunk_index=idx,
-                chunk_text=chunk_text,
+                chunk_text=piece,
                 embedding=embedding,
             )
             db.add(chunk)
+            new_chunks.append(chunk)
+        db.flush()  # idを確定させFTSに登録
+        for chunk in new_chunks:
+            db.execute(
+                sql_text(f"INSERT INTO {fts}(rowid, tokens) VALUES (:id, :tokens)"),
+                {"id": chunk.id, "tokens": to_fts_text(chunk.chunk_text)},
+            )
+        return True
 
-    def similarity_search(self, db: Session, query: str, top_k: int = 5) -> List[Dict]:
-        if not self.enabled:
-            return []
+    # ------------------------------------------------------------------
+    # 再同期(デスクトップ保存分・社長音声・FTS/日付の差分補完)
+    # ------------------------------------------------------------------
+    def pending_counts(self, db: Session) -> Dict[str, int]:
+        missing = find_unindexed(db, embedding_model=EMBEDDING_MODEL)
+        return {source: len(ids) for source, ids in missing.items()}
 
-        query_embedding = self._embed_texts([query])
-        if not query_embedding:
-            return []
+    def reconcile(
+        self,
+        db: Session,
+        embed: bool = True,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict:
+        """索引の差分を補完する。embed=Falseなら埋め込み不要の処理のみ。"""
+        report: Dict = {}
+        report["dates_filled"] = fill_recorded_dates(db)
+        report["orphan_chunks_removed"] = cleanup_orphan_chunks(db)
+        report["fts"] = sync_fts(db)
+        db.commit()
 
-        query_vector = query_embedding[0]
+        missing = find_unindexed(db, embedding_model=EMBEDDING_MODEL)
+        report["unindexed"] = {s: len(ids) for s, ids in missing.items()}
+        report["indexed"] = {"audio": 0, "ceo": 0}
+        report["errors"] = 0
+        if not embed or not self.enabled:
+            return report
 
-        if self._vector_backend != "libsql":
-            return []
+        total = sum(len(ids) for ids in missing.values())
+        done = 0
+        for source, ids in missing.items():
+            parent_table = "audio_transcriptions" if source == "audio" else "ceo_transcriptions"
+            for tid in ids:
+                row = db.execute(
+                    sql_text(f"SELECT transcript FROM {parent_table} WHERE id = :id"),
+                    {"id": tid},
+                ).first()
+                if row is None or not row[0]:
+                    done += 1
+                    continue
+                try:
+                    if self._index_generic(db, source, tid, row[0]):
+                        db.commit()
+                        report["indexed"][source] += 1
+                    else:
+                        db.rollback()
+                        report["errors"] += 1
+                except Exception as exc:
+                    db.rollback()
+                    report["errors"] += 1
+                    logger.error("再同期での索引作成に失敗 (%s id=%s): %s", source, tid, exc)
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, f"{source} #{tid}")
 
-        rows = self._retriever.similarity_search(db, query_vector, top_k)
+        if report["errors"] == 0:
+            # 全件が現行の埋め込みモデルで索引済みになったらマーカーを記録する。
+            # (マーカー確認はモデル無指定=チャンク有無のみで行う)
+            leftover = find_unindexed(db, embedding_model=None)
+            if not any(leftover.values()):
+                set_index_meta(db, "embedding_model", EMBEDDING_MODEL)
+                db.commit()
+        return report
 
-        matches: List[Dict] = []
-        for row in rows:
-            distance = row["distance"] or 0.0
-            score = max(0.0, 1.0 - float(distance))
-            matches.append(
-                {
-                    "chunk_id": row["chunk_id"],
-                    "chunk_text": row["chunk_text"],
-                    "chunk_index": row["chunk_index"],
-                    "transcription_id": row["transcription_id"],
-                    "file_path": row["file_path"],
-                    "tag": row.get("tag"),
-                    "recorded_at": row.get("recorded_at"),
-                    "duration": row.get("duration"),
-                    "distance": float(distance),
-                    "score": score,
-                }
+    def corpus_stats(self, db: Session) -> Dict[str, Dict]:
+        return self._search.corpus_stats(db)
+
+    # ------------------------------------------------------------------
+    # 検索計画
+    # ------------------------------------------------------------------
+    def plan_query(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict]] = None,
+        manual_date_range: Optional[Tuple[date, date]] = None,
+        sources: Sequence[str] = ("audio",),
+        today: Optional[date] = None,
+        allow_followup: bool = True,
+    ) -> SearchPlan:
+        if manual_date_range:
+            date_range = DateRange(
+                manual_date_range[0], manual_date_range[1], "manual", ""
+            )
+        else:
+            date_range = parse_date_from_query(query, today)
+
+        aggregate = wants_aggregate(query)
+
+        # 形式変更・メタ質問(「表形式で」「具体的に」「前の回答は〜」等)は
+        # 新規検索せず前回の参照録音を再利用する(実質問ログの約4割が該当)
+        if (
+            allow_followup
+            and chat_history
+            and not manual_date_range
+            and is_followup(query, has_history=True, has_date=date_range is not None)
+        ):
+            return SearchPlan(
+                query=query,
+                retrieval_text=query,
+                match_query=None,
+                date_range=None,
+                mode="followup",
+                sources=tuple(sources),
+                aggregate=aggregate,
             )
 
-        return matches
+        residual = query
+        if date_range and date_range.matched_text:
+            residual = residual.replace(date_range.matched_text, " ")
 
-    def similarity_search_hybrid(
+        mode = "search"
+        if not has_content_keywords(residual) and (date_range or aggregate):
+            # 「7/28の作業内容は?」「最近の記録をまとめて」のような、
+            # 期間・要約だけが手がかりの質問は期間ブラウズで確実に拾う
+            mode = "browse"
+
+        # 短い追問(「ボイドは?」等)は直前の質問を検索文に含める
+        base_text = query
+        if chat_history and len(query) <= 12:
+            prev_user = next(
+                (m.get("content", "") for m in reversed(chat_history) if m.get("role") == "user"),
+                "",
+            )
+            if prev_user:
+                base_text = f"{prev_user}\n{query}"
+
+        # 埋め込み・FTSとも指示語(「表形式で」等)を除いた内容語で検索する。
+        # 表記ゆれ同義語(ヒケ→引け等)は両方に付与する。
+        synonyms = expand_synonyms(base_text)
+        clean = strip_instructions(base_text)
+        if date_range and date_range.matched_text:
+            clean = clean.replace(date_range.matched_text, " ")
+        retrieval_text = clean.strip() or query
+        if synonyms:
+            retrieval_text = f"{retrieval_text} {' '.join(synonyms)}"
+
+        return SearchPlan(
+            query=query,
+            retrieval_text=retrieval_text,
+            match_query=build_match_query(clean, synonyms),
+            date_range=date_range,
+            mode=mode,
+            sources=tuple(sources),
+            aggregate=aggregate,
+        )
+
+    # ------------------------------------------------------------------
+    # 回答生成(ストリーミング)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _previous_hits(previous_docs: Optional[List[Dict]]) -> List[Dict]:
+        """前回の参照録音(docs形式)をコンテキスト組み立て用のヒット形式に変換する。"""
+        hits: List[Dict] = []
+        for i, d in enumerate(previous_docs or []):
+            tid = d.get("transcription_id")
+            if not tid:
+                continue
+            hits.append(
+                {
+                    "source": d.get("source") or "audio",
+                    "transcription_id": int(tid),
+                    "title": d.get("title") or d.get("file_path") or "",
+                    "recorded_date": d.get("recorded_date"),
+                    "tags": d.get("tags"),
+                    "score": 1.0 - i * 0.01,
+                    "chunk_id": None,
+                    "chunk_index": None,
+                    "chunk_text": None,
+                }
+            )
+        return hits
+
+    def answer_stream(
         self,
         db: Session,
         query: str,
-        top_k: int = 5,
-        alpha: float = HYBRID_DEFAULT_ALPHA,
-    ) -> List[Dict]:
-        """FTS × ベクトルのハイブリッド検索。
+        *,
+        sources: Sequence[str] = ("audio",),
+        manual_date_range: Optional[Tuple[date, date]] = None,
+        chat_history: Optional[List[Dict]] = None,
+        previous_docs: Optional[List[Dict]] = None,
+        alpha: Optional[float] = None,
+        retrieval_k: Optional[int] = None,
+        max_docs: Optional[int] = None,
+        today: Optional[date] = None,
+    ) -> Dict:
+        """検索→コンテキスト組み立てまで実行し、生成はストリーミングで返す。
 
-        alpha: 0.0〜1.0（1.0でベクトルのみ、0.0でFTSのみ）
+        previous_docsには直前の回答で参照した録音(docs形式)を渡す。追問と
+        判定された場合に再検索せずこれを再利用する。
+        戻り値: {"docs": [...], "meta": {...}, "stream_fn": callable}
         """
-        if not self.enabled:
-            return []
-        if not ENABLE_FTS:
-            return self.similarity_search(db, query, top_k)
+        if not self.enabled or not self._client:
+            return {"docs": [], "meta": {}, "stream_fn": lambda: iter(())}
 
-        # 埋め込み生成
-        qvecs = self._embed_texts([query])
-        if not qvecs:
-            # ベクトルが使えない場合はFTSのみ
-            return self._retriever.fts_only(db, query, top_k)
-        qvec = qvecs[0]
+        alpha = HYBRID_DEFAULT_ALPHA if alpha is None else float(alpha)
+        k = int(retrieval_k or RETRIEVAL_K)
 
-        # 候補母集団の件数
-        cand_k = max(top_k * HYBRID_CAND_MULT, top_k)
+        t0 = time.time()
+        plan = self.plan_query(
+            query,
+            chat_history=chat_history,
+            manual_date_range=manual_date_range,
+            sources=sources,
+            today=today,
+        )
+        prev_hits = self._previous_hits(previous_docs) if plan.mode == "followup" else []
+        if plan.mode == "followup" and not prev_hits:
+            # 再利用できる前回の参照録音が無ければ通常検索として計画し直す
+            plan = self.plan_query(
+                query,
+                chat_history=chat_history,
+                manual_date_range=manual_date_range,
+                sources=sources,
+                today=today,
+                allow_followup=False,
+            )
 
-        if self._vector_backend != "libsql":
-            return []
+        notes: List[str] = []
+        fallback = None
+        widened_term = None
+        coverage: Optional[Dict] = None
 
-        return self._retriever.hybrid_search(db, query, qvec, top_k, cand_k, alpha)
+        # --- 追問: 前回の参照録音を再利用(検索・埋め込みなし) ---
+        if plan.mode == "followup":
+            n_docs = len(prev_hits)
+            per_doc_cap = None
+            if n_docs > CONTEXT_MAX_DOCS:
+                per_doc_cap = max(AGGREGATE_MIN_DOC_CHARS, CONTEXT_MAX_CHARS // n_docs)
+            t1 = time.time()
+            docs = build_context_docs(
+                db,
+                prev_hits,
+                max_docs=max(1, n_docs),
+                max_chars=CONTEXT_MAX_CHARS,
+                whole_doc_threshold=WHOLE_DOC_THRESHOLD,
+                order="score",
+                per_doc_cap=per_doc_cap,
+            )
+            notes.append(
+                "この質問は直前のやり取りへの追加要望と判断し、"
+                "前回の回答で参照した録音を引き続き参照している"
+            )
+            return self._build_result(
+                plan, query, chat_history, docs, notes,
+                fallback=None, widened_term=None, n_candidates=len(prev_hits),
+                coverage=None, today=today, t0=t0, t1=t1,
+            )
 
+        # 期間ブラウズ・集約系は件数を広げ、1録音あたりを薄く読む(網羅性優先)
+        if max_docs:
+            n_docs = int(max_docs)
+        elif plan.mode == "browse" or plan.aggregate:
+            n_docs = AGGREGATE_MAX_DOCS
+        else:
+            n_docs = CONTEXT_MAX_DOCS
+
+        filters = SearchFilters(
+            date_from=plan.date_range.start if plan.date_range else None,
+            date_to=plan.date_range.end if plan.date_range else None,
+            sources=plan.sources,
+        )
+
+        if plan.mode == "browse":
+            hits = self._search.browse_recent(db, filters, max_recordings=n_docs + 2)
+            if not hits and plan.date_range and plan.date_range.kind == "recency":
+                # 「最近」で30日以内にデータがなければ全期間の直近から
+                fallback = "recency_widened"
+                filters = SearchFilters(sources=plan.sources)
+                hits = self._search.browse_recent(db, filters, max_recordings=n_docs + 2)
+        else:
+            qvecs = self._embed_texts([plan.retrieval_text])
+            qvec = qvecs[0] if qvecs else None
+            hits = self._search.hybrid_search(
+                db, plan.retrieval_text, qvec, filters, k, alpha,
+                match_query=plan.match_query,
+            )
+            if not hits and plan.date_range and plan.date_range.kind == "recency":
+                fallback = "recency_widened"
+                filters = SearchFilters(sources=plan.sources)
+                hits = self._search.hybrid_search(
+                    db, plan.retrieval_text, qvec, filters, k, alpha,
+                    match_query=plan.match_query,
+                )
+
+            # 「ヒケ」等の引用符付き用語は必須語として扱う。期間内に本語も
+            # 表記ゆれも完全一致しない一方で全期間には存在する場合のみ、
+            # 期間を広げて確実に拾う
+            if plan.date_range and filters.date_from is not None:
+                for term in re.findall(r"[「『\"]([^」』\"]{1,20})[」』\"]", query):
+                    probes = [term] + expand_synonyms(term)
+                    queries = [q for q in (fts_query_exact(p) for p in probes) if q]
+                    if not queries:
+                        continue
+                    in_range = any(
+                        self._search.keyword_search(db, q, filters, 1) for q in queries
+                    )
+                    if in_range:
+                        continue
+                    unfiltered = SearchFilters(sources=plan.sources)
+                    if any(
+                        self._search.keyword_search(db, q, unfiltered, 1) for q in queries
+                    ):
+                        fallback = "quoted_term_widened"
+                        widened_term = term
+                        filters = unfiltered
+                        hits = self._search.hybrid_search(
+                            db, plan.retrieval_text, qvec, filters, k, alpha,
+                            match_query=plan.match_query,
+                        )
+                        break
+
+        t1 = time.time()
+
+        if not hits:
+            msg = "関連する録音が見つかりませんでした。"
+            if plan.date_range:
+                available = self._search.available_date_range(db, plan.sources)
+                msg = (
+                    f"指定された期間（{plan.date_range.start} 〜 {plan.date_range.end}）に"
+                    "該当する録音が見つかりませんでした。"
+                )
+                if available:
+                    msg += f"\n\nデータが存在する期間: {available[0]} 〜 {available[1]}"
+            return {
+                "docs": [],
+                "meta": self._build_meta(plan, fallback, 0, [], 0, t0, t1, t1),
+                "stream_fn": lambda m=msg: iter((m,)),
+            }
+
+        per_doc_cap = None
+        if n_docs > CONTEXT_MAX_DOCS:
+            per_doc_cap = max(AGGREGATE_MIN_DOC_CHARS, CONTEXT_MAX_CHARS // n_docs)
+        order = "date" if plan.mode == "browse" else "score"
+        docs = build_context_docs(
+            db,
+            hits,
+            max_docs=n_docs,
+            max_chars=CONTEXT_MAX_CHARS,
+            whole_doc_threshold=WHOLE_DOC_THRESHOLD,
+            order=order,
+            per_doc_cap=per_doc_cap,
+        )
+
+        # 補足メモ(モデルがコンテキストの範囲を誤解しないように明示する)
+        if fallback == "recency_widened" and plan.date_range:
+            notes.append(
+                f"「{plan.date_range.matched_text or '最近'}」の期間内に録音が無いため、"
+                "全期間の直近の録音を参照している"
+            )
+        elif fallback == "quoted_term_widened" and widened_term:
+            notes.append(
+                f"「{widened_term}」が指定期間内に見つからないため、"
+                "全期間から検索した(指定期間外の録音を含む)"
+            )
+        if plan.mode == "browse" and filters.date_from is not None:
+            total_in_range = self._search.count_recordings(db, filters)
+            if total_in_range > len(docs):
+                coverage = {"in_range": total_in_range, "used": len(docs)}
+                notes.append(
+                    f"期間内の録音は全{total_in_range}件あり、新しい順に{len(docs)}件を"
+                    "参照している(全件ではない)。件数を断定する場合はその旨を付記する"
+                )
+
+        return self._build_result(
+            plan, query, chat_history, docs, notes,
+            fallback=fallback, widened_term=widened_term, n_candidates=len(hits),
+            coverage=coverage, today=today, t0=t0, t1=t1,
+        )
+
+    def _build_result(
+        self,
+        plan: SearchPlan,
+        query: str,
+        chat_history: Optional[List[Dict]],
+        docs: List[ContextDoc],
+        notes: List[str],
+        *,
+        fallback: Optional[str],
+        widened_term: Optional[str],
+        n_candidates: int,
+        coverage: Optional[Dict],
+        today: Optional[date],
+        t0: float,
+        t1: float,
+    ) -> Dict:
+        """コンテキスト確定後の共通処理(プロンプト構築・ストリーム関数・メタ)。"""
+        corpus = "ceo" if tuple(plan.sources) == ("ceo",) else "audio"
+        messages = build_chat_messages(
+            query, docs, chat_history, today, corpus=corpus, notes=notes or None
+        )
+        t2 = time.time()
+
+        client = self._client
+
+        def _stream_gen():
+            try:
+                with client.responses.stream(model=COMPLETION_MODEL, input=messages) as stream:
+                    for event in stream:
+                        et = getattr(event, "type", None)
+                        if et == "response.output_text.delta":
+                            delta = getattr(event, "delta", None)
+                            if isinstance(delta, str) and delta:
+                                yield delta
+                        elif et == "response.error":
+                            err = getattr(event, "error", None)
+                            logger.error("Responses stream error: %s", err)
+                            yield f"\n\n⚠️ 回答生成でエラーが発生しました: {err}"
+            except Exception as exc:
+                logger.error("Responses stream failed: %s", exc, exc_info=True)
+                yield (
+                    f"\n\n⚠️ 回答の生成に失敗しました（モデル: {COMPLETION_MODEL}）。\n"
+                    f"エラー: {exc}"
+                )
+
+        used_chars = sum(len(d.text) for d in docs)
+        meta = self._build_meta(plan, fallback, n_candidates, docs, used_chars, t0, t1, t2)
+        meta["widened_term"] = widened_term
+        meta["aggregate"] = plan.aggregate
+        meta["coverage"] = coverage
+        return {"docs": [d.to_dict() for d in docs], "meta": meta, "stream_fn": _stream_gen}
+
+    @staticmethod
+    def _build_meta(
+        plan: SearchPlan,
+        fallback: Optional[str],
+        n_candidates: int,
+        docs: List[ContextDoc],
+        used_chars: int,
+        t0: float,
+        t1: float,
+        t2: float,
+    ) -> Dict:
+        return {
+            "mode": plan.mode,
+            "sources": list(plan.sources),
+            "date_filter": (
+                {
+                    "start": plan.date_range.start.isoformat(),
+                    "end": plan.date_range.end.isoformat(),
+                    "kind": plan.date_range.kind,
+                    "matched_text": plan.date_range.matched_text,
+                }
+                if plan.date_range
+                else None
+            ),
+            "fallback": fallback,
+            "candidates": n_candidates,
+            "used_docs": len(docs),
+            "used_context_chars": used_chars,
+            "doc_summaries": [
+                {
+                    "n": d.n,
+                    "title": d.title,
+                    "recorded_date": d.recorded_date,
+                    "score": d.score,
+                    "source": d.source,
+                }
+                for d in docs
+            ],
+            "timings_ms": {
+                "retrieval": int((t1 - t0) * 1000.0),
+                "prompt_build": int((t2 - t1) * 1000.0),
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # 埋め込み
+    # ------------------------------------------------------------------
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not self._client:
             return []
         try:
-            response = self._client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+            # dimensionsを明示することで、3-large(本来3072次元)でも既存の
+            # スキーマ(EMBEDDING_DIM=1536)にそのまま格納できる
+            response = self._client.embeddings.create(
+                model=EMBEDDING_MODEL, input=texts, dimensions=EMBEDDING_DIM
+            )
         except Exception as exc:  # pragma: no cover - APIエラー
             logger.error("OpenAI embeddings API 呼び出しで失敗: %s", exc)
             return []
@@ -182,210 +677,6 @@ class RAGService:
                     len(embedding) if embedding else None,
                 )
         return embeddings
-
-    def _generate_answer(self, prompt: str) -> str:
-        if not self._client:
-            return ""
-
-        try:
-            # Responses API を使用（messages ではなく input）。温度は未指定＝既定値。
-            response = self._client.responses.create(
-                model=COMPLETION_MODEL,
-                input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "あなたはRAGベースの社内QAアシスタントです。"
-                            "事実は必ず与えられたコンテキストに基づき、出典として [#番号] を明記してください。"
-                            "コンテキスト外の推測はしないでください。足りない点は『不足情報』に列挙します。"
-                            "文体は簡潔で日本語、箇条書きを優先します。"
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-            )
-        except Exception as exc:  # pragma: no cover - APIエラー
-            msg = str(exc)
-            logger.error("OpenAI Responses API 呼び出しで失敗: %s", msg)
-            if "maximum context length" in msg or "context_length_exceeded" in msg or "too many tokens" in msg:
-                return (
-                    "回答生成時にプロンプトが長過ぎました。検索上限または 'RAG_CONTEXT_MAX_*' を下げて再実行してください。"
-                )
-            return "回答生成中にエラーが発生しました。ログを確認してください。"
-
-        # SDK の output_text ヘルパーを優先使用（無い場合はフォールバック）
-        try:
-            text_out = getattr(response, "output_text", None)
-            if isinstance(text_out, str) and text_out.strip():
-                return text_out.strip()
-        except Exception:
-            pass
-
-        # フォールバック：output.items からテキストを連結（Responses API仕様の将来変化に備える）
-        out = []
-        try:
-            for item in getattr(response, "output", []) or []:
-                # item には {type: "message", content: [{type:"text", text:"..."}, ...]} 等が入る想定
-                contents = getattr(item, "content", None) or item.get("content") if isinstance(item, dict) else None
-                if isinstance(contents, list):
-                    for c in contents:
-                        t = getattr(c, "text", None) or (c.get("text") if isinstance(c, dict) else None)
-                        if isinstance(t, str):
-                            out.append(t)
-        except Exception:
-            pass
-
-        text_joined = "\n".join(out).strip()
-        return text_joined or "回答を生成できませんでした。"
-
-    # --- Streaming API ---
-    def answer_stream(
-        self,
-        db: Session,
-        query: str,
-        top_k: int | None = None,
-        hybrid: bool = False,
-        alpha: float = HYBRID_DEFAULT_ALPHA,
-        context_k: int | None = None,
-        chat_history: Optional[List[Dict]] = None,
-    ) -> Dict:
-        """検索→プロンプト生成までを先に実行し、テキスト生成はストリーミングで返す。
-
-        Args:
-            chat_history: 過去の会話履歴 [{"role": "user"|"assistant", "content": "..."}, ...]
-
-        戻り値に `stream_fn`（呼び出すとジェネレータを返す関数）を含める。
-        UI側で `st.write_stream(result['stream_fn']())` などで逐次表示できる。
-        """
-        if not self.enabled or not self._client:
-            return {"matches": [], "meta": {}, "stream_fn": lambda: iter(())}
-
-        t0 = time.time()
-        tk = int(top_k or RETRIEVAL_K)
-        matches_all = (
-            self.similarity_search_hybrid(db, query, tk, alpha)
-            if hybrid
-            else self.similarity_search(db, query, tk)
-        )
-
-        # 日付フィルタを適用
-        date_range = parse_date_from_query(query)
-        date_filtered = False
-        date_detected = date_range is not None
-        date_no_match = False
-        if date_range and matches_all:
-            filtered = filter_matches_by_date(matches_all, date_range)
-            if filtered:
-                # 日付でフィルタした結果を優先使用
-                matches_all = filtered
-                date_filtered = True
-            else:
-                # 日付は検出されたがマッチするデータがない
-                date_no_match = True
-            logger.debug(
-                "Date filter applied: %s to %s, filtered=%d matches",
-                date_range[0],
-                date_range[1],
-                len(filtered) if filtered else 0,
-            )
-
-        t1 = time.time()
-        if not matches_all:
-            # 空ジェネレータを返す
-            no_result_msg = "関連するテキストが見つかりませんでした。"
-            if date_range:
-                no_result_msg = f"指定された期間（{date_range[0]} 〜 {date_range[1]}）に該当するデータが見つかりませんでした。"
-            return {
-                "matches": [],
-                "meta": {
-                    "candidates": 0,
-                    "used_context_chunks": 0,
-                    "used_context_chars": 0,
-                    "date_filter": date_range,
-                    "timings_ms": {"retrieval": int((t1 - t0) * 1000.0), "prompt_build": 0},
-                },
-                "stream_fn": lambda msg=no_result_msg: iter((msg,)),
-            }
-
-        # プロンプト用に上限を適用
-        use_k = int(context_k or CONTEXT_MAX_CHUNKS)
-        selected: List[Dict] = []
-        used_chars = 0
-        for m in matches_all:
-            if len(selected) >= use_k:
-                break
-            txt = m.get("chunk_text") or ""
-            add_len = len(txt) + 128
-            if used_chars + add_len > CONTEXT_MAX_CHARS:
-                break
-            selected.append(m)
-            used_chars += add_len
-
-        if not selected:
-            head = matches_all[0]
-            trimmed = dict(head)
-            trimmed["chunk_text"] = (head.get("chunk_text") or "")[: max(200, CONTEXT_MAX_CHARS // 2)]
-            selected = [trimmed]
-
-        # 会話形式のプロンプトを生成
-        messages = build_chat_prompt(query, selected, chat_history)
-        t2 = time.time()
-
-        retrieval_s = (t1 - t0)
-        prompt_build_s = (t2 - t1)
-
-        def _stream_gen():
-            try:
-                with self._client.responses.stream(
-                    model=COMPLETION_MODEL,
-                    input=messages,
-                ) as stream:
-                    tgen0 = time.time()
-                    for event in stream:
-                        et = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
-                        if et == "response.output_text.delta":
-                            delta = getattr(event, "delta", None) or (event.get("delta") if isinstance(event, dict) else None)
-                            if isinstance(delta, str) and delta:
-                                yield delta
-                        elif et == "response.error":
-                            err = getattr(event, "error", None) or (event.get("error") if isinstance(event, dict) else None)
-                            logger.error("Responses stream error: %s", err)
-                    tgen1 = time.time()
-                    generate_s = max(0.0, tgen1 - tgen0)
-                    total_s = retrieval_s + prompt_build_s + generate_s
-                    try:
-                        logger.debug(
-                            "RAG timings (s): retrieval=%.3fs, prompt_build=%.3fs, generate=%.3fs, total=%.3fs (candidates=%d, used_chunks=%d)",
-                            retrieval_s,
-                            prompt_build_s,
-                            generate_s,
-                            total_s,
-                            len(matches_all),
-                            len(selected),
-                        )
-                    except Exception:
-                        pass
-            except Exception as exc:
-                logger.error("Responses stream failed: %s", exc)
-                yield "\n[生成エラー] 回答のストリーミング中にエラーが発生しました。ログを確認してください。"
-
-        meta = {
-            "candidates": len(matches_all),
-            "used_context_chunks": len(selected),
-            "used_context_chars": used_chars,
-            "date_filter": {"start": str(date_range[0]), "end": str(date_range[1])} if date_range else None,
-            "date_detected": date_detected,
-            "date_filtered": date_filtered,
-            "date_no_match": date_no_match,
-            "limits": {"max_chunks": use_k, "max_chars": CONTEXT_MAX_CHARS},
-            # 生成時間はUI側で計測し合算
-            "timings_ms": {
-                "retrieval": int((t1 - t0) * 1000.0),
-                "prompt_build": int((t2 - t1) * 1000.0),
-            },
-        }
-
-        return {"matches": selected, "meta": meta, "stream_fn": _stream_gen}
 
 
 rag_service = RAGService()
