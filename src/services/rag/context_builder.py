@@ -86,8 +86,14 @@ def build_context_docs(
     whole_doc_threshold: int = 4000,
     neighbor_window: int = 1,
     order: str = "score",  # "score" | "date"
+    per_doc_cap: Optional[int] = None,
 ) -> List[ContextDoc]:
-    """検索ヒット(チャンク単位)を録音単位のコンテキストに変換する。"""
+    """検索ヒット(チャンク単位)を録音単位のコンテキストに変換する。
+
+    per_doc_capを指定すると1録音あたりの文字数上限を固定できる。
+    期間要約などで多数の録音を薄く広く読むために使う(未指定時は従来の
+    「whole_doc_thresholdと均等割の大きい方」)。
+    """
     groups: Dict[Tuple[str, int], Dict] = {}
     for h in hits:
         key = (h["source"], int(h["transcription_id"]))
@@ -113,7 +119,8 @@ def build_context_docs(
     else:
         ordered.sort(key=lambda g: g["score"], reverse=True)
 
-    per_doc_cap = max(whole_doc_threshold, max_chars // max(1, max_docs))
+    if per_doc_cap is None:
+        per_doc_cap = max(whole_doc_threshold, max_chars // max(1, max_docs))
     docs: List[ContextDoc] = []
     used_chars = 0
 

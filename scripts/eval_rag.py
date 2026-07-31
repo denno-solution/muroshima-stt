@@ -18,7 +18,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from models import get_db  # noqa: E402
-from services.rag_service import CONTEXT_MAX_CHARS, CONTEXT_MAX_DOCS, RETRIEVAL_K, WHOLE_DOC_THRESHOLD, get_rag_service  # noqa: E402
+from services.rag_service import (  # noqa: E402
+    AGGREGATE_MAX_DOCS,
+    AGGREGATE_MIN_DOC_CHARS,
+    CONTEXT_MAX_CHARS,
+    CONTEXT_MAX_DOCS,
+    HYBRID_DEFAULT_ALPHA,
+    RETRIEVAL_K,
+    WHOLE_DOC_THRESHOLD,
+    get_rag_service,
+)
 from services.rag.context_builder import build_context_docs  # noqa: E402
 from services.rag.search_service import SearchFilters  # noqa: E402
 
@@ -31,27 +40,49 @@ def evaluate(rag, db, query: str, sources=("audio",)) -> None:
         if plan.date_range
         else "なし"
     )
-    print(f"    モード: {plan.mode} / 日付判定: {date_desc}")
+    print(
+        f"    モード: {plan.mode}{' (集約)' if plan.aggregate else ''}"
+        f" / 日付判定: {date_desc}"
+    )
+    if plan.match_query:
+        print(f"    FTS: {plan.match_query[:100]}")
 
     filters = SearchFilters(
         date_from=plan.date_range.start if plan.date_range else None,
         date_to=plan.date_range.end if plan.date_range else None,
         sources=plan.sources,
     )
+    n_docs = (
+        AGGREGATE_MAX_DOCS
+        if (plan.mode == "browse" or plan.aggregate)
+        else CONTEXT_MAX_DOCS
+    )
+    per_doc_cap = (
+        max(AGGREGATE_MIN_DOC_CHARS, CONTEXT_MAX_CHARS // n_docs)
+        if n_docs > CONTEXT_MAX_DOCS
+        else None
+    )
     if plan.mode == "browse":
-        hits = rag.search.browse_recent(db, filters, max_recordings=CONTEXT_MAX_DOCS + 2)
+        hits = rag.search.browse_recent(db, filters, max_recordings=n_docs + 2)
     else:
         qvecs = rag._embed_texts([plan.retrieval_text])
         hits = rag.search.hybrid_search(
-            db, plan.retrieval_text, qvecs[0] if qvecs else None, filters, RETRIEVAL_K, 0.6
+            db,
+            plan.retrieval_text,
+            qvecs[0] if qvecs else None,
+            filters,
+            RETRIEVAL_K,
+            HYBRID_DEFAULT_ALPHA,
+            match_query=plan.match_query,
         )
     docs = build_context_docs(
         db,
         hits,
-        max_docs=CONTEXT_MAX_DOCS,
+        max_docs=n_docs,
         max_chars=CONTEXT_MAX_CHARS,
         whole_doc_threshold=WHOLE_DOC_THRESHOLD,
         order="date" if plan.mode == "browse" else "score",
+        per_doc_cap=per_doc_cap,
     )
     for d in docs:
         kind = "全文" if d.is_full_text else "抜粋"

@@ -55,7 +55,13 @@ def build_chat_messages(
     chat_history: Optional[List[Dict]] = None,
     today: Optional[date] = None,
     corpus: str = "audio",
+    notes: Optional[List[str]] = None,
 ) -> List[Dict]:
+    """回答生成用メッセージ列を組み立てる。
+
+    notesには検索システム側の補足(期間拡大した・期間内の一部のみ参照している等)を
+    渡す。モデルがコンテキストの範囲を誤解して「日付が矛盾する」等と混乱するのを防ぐ。
+    """
     messages: List[Dict] = [{"role": "system", "content": build_system_prompt(today, corpus)}]
 
     if chat_history:
@@ -65,8 +71,13 @@ def build_chat_messages(
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
 
+    notes_block = ""
+    if notes:
+        notes_block = "検索システムからの補足:\n" + "\n".join(f"- {n}" for n in notes) + "\n\n"
+
     user_prompt = (
         "以下は音声DBから検索した録音の文字起こしです。これに基づいて質問に答えてください。\n\n"
+        f"{notes_block}"
         f"{format_context_block(docs)}\n\n"
         f"質問:\n{query}"
     )

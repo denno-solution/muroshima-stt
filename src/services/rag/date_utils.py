@@ -38,10 +38,92 @@ def _shift_months(base: date, months_back: int) -> tuple[int, int]:
     return idx // 12, idx % 12 + 1
 
 
+# 範囲表現「X～Y」「XからYまで」の両辺になりうる日付表現
+_FULL_DATE_PAT = r"\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2}日?"
+_YEAR_MONTH_PAT = r"\d{4}[年/]\d{1,2}月?"
+_MONTH_DAY_PAT = r"\d{1,2}[月/]\d{1,2}日?"
+_MONTH_PAT = r"\d{1,2}月"
+_RANGE_SIDE_PAT = f"(?:{_FULL_DATE_PAT}|{_YEAR_MONTH_PAT}|{_MONTH_DAY_PAT}|{_MONTH_PAT})"
+_RANGE_RE = re.compile(
+    f"({_RANGE_SIDE_PAT})\\s*(?:[～〜~]|から)\\s*({_RANGE_SIDE_PAT})(?:まで)?"
+)
+
+
+def _parse_range_side(
+    s: str, today: date, default_year: Optional[int]
+) -> Optional[tuple[date, date, bool]]:
+    """範囲の片辺を(開始, 終了, 年が明示されていたか)に解釈する。"""
+    m = re.fullmatch(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", s)
+    if m:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return d, d, True
+        except ValueError:
+            return None
+    m = re.fullmatch(r"(\d{4})[年/](\d{1,2})月?", s)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12:
+            lo, hi = _month_range(year, month)
+            return lo, hi, True
+        return None
+    m = re.fullmatch(r"(\d{1,2})[月/](\d{1,2})日?", s)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        year = default_year if default_year else today.year
+        try:
+            d = date(year, month, day)
+        except ValueError:
+            return None
+        if default_year is None and d > today:
+            d = date(year - 1, month, day)
+        return d, d, False
+    m = re.fullmatch(r"(\d{1,2})月", s)
+    if m:
+        month = int(m.group(1))
+        if not 1 <= month <= 12:
+            return None
+        if default_year:
+            year = default_year
+        else:
+            year = today.year if month <= today.month else today.year - 1
+        lo, hi = _month_range(year, month)
+        return lo, hi, False
+    return None
+
+
+def _parse_date_range_expr(q: str, today: date) -> Optional[DateRange]:
+    """「2025/1/01～2025/01/16」「7月1日から7月15日まで」等の範囲を解釈する。"""
+    m = _RANGE_RE.search(q)
+    if not m:
+        return None
+    left = _parse_range_side(m.group(1), today, None)
+    if not left:
+        return None
+    start, _, _ = left
+    right = _parse_range_side(m.group(2), today, start.year)
+    if not right:
+        return None
+    _, end, right_explicit_year = right
+    if end < start and not right_explicit_year:
+        # 「12/25から1/5まで」のような年またぎは翌年として解釈する
+        retry = _parse_range_side(m.group(2), today, start.year + 1)
+        if retry:
+            _, end, _ = retry
+    if end < start:
+        start, end = end, start
+    return DateRange(start, end, "explicit", m.group(0))
+
+
 def parse_date_from_query(query: str, today: Optional[date] = None) -> Optional[DateRange]:
     """クエリから日付範囲を抽出する。より具体的な表現を優先する。"""
     today = today or date.today()
     q = query or ""
+
+    # --- 範囲表現 (2025/1/01～2025/01/16 / 7月1日から7月15日まで) ---
+    dr = _parse_date_range_expr(q, today)
+    if dr:
+        return dr
 
     # --- 完全な年月日 (2026年7月28日 / 2026/7/28 / 2026-07-28) ---
     m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", q)

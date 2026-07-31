@@ -147,17 +147,56 @@ def cleanup_orphan_chunks(db: Session) -> int:
     return removed
 
 
-def find_unindexed(db: Session) -> Dict[str, List[int]]:
-    """チャンク未作成の文字起こしID一覧(埋め込み生成が必要な差分)。"""
+def get_index_meta(db: Session, key: str) -> Optional[str]:
+    """索引メタ情報(埋め込みモデル名等)を読む。テーブル未作成ならNone。"""
+    try:
+        row = db.execute(
+            text("SELECT value FROM rag_index_meta WHERE key = :key"), {"key": key}
+        ).first()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def set_index_meta(db: Session, key: str, value: str) -> None:
+    """索引メタ情報を保存する(テーブルは必要時に作成)。"""
+    db.execute(
+        text("CREATE TABLE IF NOT EXISTS rag_index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    )
+    db.execute(
+        text("INSERT OR REPLACE INTO rag_index_meta(key, value) VALUES (:key, :value)"),
+        {"key": key, "value": value},
+    )
+
+
+def find_unindexed(db: Session, embedding_model: Optional[str] = None) -> Dict[str, List[int]]:
+    """チャンク未作成の文字起こしID一覧(埋め込み生成が必要な差分)。
+
+    embedding_modelを渡した場合、索引時のモデル(rag_index_metaに記録)と
+    不一致なら全録音を再索引対象として返す。埋め込みモデル変更時に旧ベクトルと
+    新ベクトルが混在すると距離計算が壊れるため、全量再作成へ誘導する。
+    """
+    model_changed = (
+        embedding_model is not None
+        and get_index_meta(db, "embedding_model") != embedding_model
+    )
     result: Dict[str, List[int]] = {}
     for source, (chunk_table, parent) in _CHUNK_TABLES.items():
-        rows = db.execute(
-            text(
-                f"SELECT t.id AS id FROM {parent} t "
-                f"WHERE t.transcript IS NOT NULL AND t.transcript != '' "
-                f"AND NOT EXISTS (SELECT 1 FROM {chunk_table} c WHERE c.transcription_id = t.id) "
-                f"ORDER BY t.id"
-            )
-        ).mappings().all()
+        if model_changed:
+            rows = db.execute(
+                text(
+                    f"SELECT t.id AS id FROM {parent} t "
+                    f"WHERE t.transcript IS NOT NULL AND t.transcript != '' ORDER BY t.id"
+                )
+            ).mappings().all()
+        else:
+            rows = db.execute(
+                text(
+                    f"SELECT t.id AS id FROM {parent} t "
+                    f"WHERE t.transcript IS NOT NULL AND t.transcript != '' "
+                    f"AND NOT EXISTS (SELECT 1 FROM {chunk_table} c WHERE c.transcription_id = t.id) "
+                    f"ORDER BY t.id"
+                )
+            ).mappings().all()
         result[source] = [r["id"] for r in rows]
     return result

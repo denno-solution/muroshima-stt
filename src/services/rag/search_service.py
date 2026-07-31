@@ -182,19 +182,40 @@ class SearchService:
         filters: SearchFilters,
         k: int,
         alpha: float,
+        match_query: Optional[str] = None,
     ) -> List[Dict]:
-        """ベクトル×キーワードのハイブリッド検索。"""
+        """ベクトル×キーワードのハイブリッド検索。
+
+        match_queryを渡すとFTS側はそれを使う(内容語のみ+同義語展開など、
+        呼び出し側で組み立てたクエリを注入できる)。省略時は全文からOR構築。
+        """
         cand_k = max(k, k * 3)
         vec_rows = (
             self.vector_search(db, query_vector, filters, cand_k)
             if query_vector
             else []
         )
-        match_q = fts_query_any(query_text)
+        match_q = match_query if match_query is not None else fts_query_any(query_text)
         fts_rows = (
             self.keyword_search(db, match_q, filters, cand_k) if match_q else []
         )
         return blend_scores(vec_rows, fts_rows, alpha)[:k]
+
+    def count_recordings(self, db: Session, filters: SearchFilters) -> int:
+        """期間内の録音件数(browse時の網羅率表示用)。"""
+        total = 0
+        for source in filters.sources:
+            cfg = _SOURCES[source]
+            row = db.execute(
+                text(
+                    f"SELECT COUNT(*) AS n FROM {cfg['parent']} AS trans "
+                    f"WHERE trans.transcript IS NOT NULL AND trans.transcript != ''"
+                    f"{_DATE_WHERE}"
+                ),
+                filters.date_params(),
+            ).mappings().first()
+            total += int(row["n"] if row else 0)
+        return total
 
     def browse_recent(
         self,

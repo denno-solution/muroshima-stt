@@ -119,3 +119,36 @@ class TestRecency:
 
     def test_no_date(self):
         assert _parse("ボイドの対策を教えて") is None
+
+
+class TestDateRanges:
+    def test_full_date_range_real_log(self):
+        # 実質問#20: 従来は先頭日のみ(2025-01-01単日)に解釈されていた
+        dr = _parse("2025/1/01～2025/01/16　までの　成形に関係する業務についてまとめてください")
+        assert (dr.start, dr.end) == (date(2025, 1, 1), date(2025, 1, 16))
+        assert dr.kind == "explicit"
+
+    def test_month_day_range_inherits_year(self):
+        dr = _parse("7/1〜7/15の記録")
+        assert (dr.start, dr.end) == (date(2026, 7, 1), date(2026, 7, 15))
+
+    def test_kara_made_range(self):
+        dr = _parse("7月1日から7月15日までの作業")
+        assert (dr.start, dr.end) == (date(2026, 7, 1), date(2026, 7, 15))
+
+    def test_month_to_month_range(self):
+        dr = _parse("2026年6月〜7月の記録")
+        assert (dr.start, dr.end) == (date(2026, 6, 1), date(2026, 7, 31))
+
+    def test_range_across_year_boundary(self):
+        dr = _parse("12/25から1/5までの状況")
+        assert (dr.start, dr.end) == (date(2025, 12, 25), date(2026, 1, 5))
+
+    def test_hyphen_date_is_not_a_range(self):
+        # ISO形式のハイフンを範囲区切りと誤認しない
+        dr = _parse("2025-10-15の業務内容")
+        assert (dr.start, dr.end) == (date(2025, 10, 15), date(2025, 10, 15))
+
+    def test_matched_text_covers_whole_range(self):
+        dr = _parse("7/1〜7/15の記録")
+        assert dr.matched_text == "7/1〜7/15"

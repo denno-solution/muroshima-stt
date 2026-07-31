@@ -171,3 +171,30 @@ class TestNormalizeToJstDate:
         assert normalize_to_jst_date(None) is None
         assert normalize_to_jst_date("") is None
         assert normalize_to_jst_date("not a date") is None
+
+
+class TestPerDocCap:
+    def test_cap_limits_each_doc(self, mini_db):
+        # 期間要約モード: 多数の録音を1件あたり少ない文字数で読む
+        docs = build_context_docs(
+            mini_db,
+            [_hit(2, 1, 0.9)],
+            max_docs=30,
+            max_chars=40000,
+            whole_doc_threshold=4000,
+            per_doc_cap=100,
+        )
+        assert len(docs) == 1
+        assert docs[0].truncated
+        assert len(docs[0].text) <= 100 + len("\n（文字数上限のため以下省略）")
+
+    def test_default_behavior_unchanged_without_cap(self, mini_db):
+        docs = build_context_docs(
+            mini_db,
+            [_hit(1, 0, 0.9)],
+            max_docs=3,
+            max_chars=40000,
+            whole_doc_threshold=4000,
+        )
+        assert docs[0].text == "短い録音の全文です。"
+        assert not docs[0].truncated

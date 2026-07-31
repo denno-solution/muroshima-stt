@@ -191,8 +191,15 @@ def _render_search_badges(meta: Dict) -> None:
             parts.append(f"📅 :green[期間指定: {span}]")
         else:
             parts.append(f"📅 :green[期間で絞り込み: {span}]")
-    if meta.get("mode") == "browse":
+    coverage = meta.get("coverage")
+    if coverage:
+        parts.append(
+            f"📚 :gray[期間内{coverage['in_range']}件中、新しい順に{coverage['used']}件を参照]"
+        )
+    elif meta.get("mode") == "browse":
         parts.append("📚 :gray[期間内の録音を新しい順に参照]")
+    if meta.get("mode") == "followup":
+        parts.append("🔁 :gray[前回の参照録音を再利用]")
     if meta.get("fallback") == "recency_widened":
         parts.append("⚠️ :orange[期間内にデータがないため全期間から検索]")
     elif meta.get("fallback") == "quoted_term_widened":
@@ -276,7 +283,8 @@ def _ensure_index(rag, profile: _ChatProfile, pending: Dict[str, int]) -> None:
         st.warning(
             f"⚠️ **{total}件の録音が検索インデックスに未登録です**"
             f"（現場録音 {pending.get('audio', 0)}件 / 社長音声 {pending.get('ceo', 0)}件）。"
-            "デスクトップ版で保存されたデータ等が該当します。"
+            "デスクトップ版で保存されたデータや、検索エンジンの更新"
+            "（埋め込みモデル変更）による再作成分が該当します。"
             "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
         )
         if st.button(
@@ -398,6 +406,15 @@ def _run_chat(profile: _ChatProfile):
         for m in st.session_state[hist_key][:-1]
         if m["role"] in ("user", "assistant") and m.get("content")
     ]
+    # 直前の回答で参照した録音(「表形式で」等の追問時に再検索せず再利用する)
+    previous_docs = next(
+        (
+            m.get("contexts")
+            for m in reversed(st.session_state[hist_key][:-1])
+            if m.get("role") == "assistant" and m.get("contexts")
+        ),
+        None,
+    )
 
     with st.spinner("音声DBを検索中…"):
         db = next(get_db())
@@ -408,6 +425,7 @@ def _run_chat(profile: _ChatProfile):
                 sources=profile.sources,
                 manual_date_range=manual_range,
                 chat_history=chat_history_for_rag,
+                previous_docs=previous_docs,
             )
         except Exception as e:
             _handle_rag_error(e, "検索実行")
