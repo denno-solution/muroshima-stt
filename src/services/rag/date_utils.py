@@ -1,143 +1,155 @@
+"""クエリからの日付範囲抽出。
+
+検索はSQLの WHERE recorded_date BETWEEN で行うため、ここでは
+「クエリ文字列 → DateRange」の変換のみを担当する。
+"""
+
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Optional
+
+# 「最近」の既定ウィンドウ(日)
+RECENCY_DAYS = 30
 
 
-def parse_date_from_query(query: str) -> Optional[Tuple[date, date]]:
-    """ユーザークエリから日付範囲を抽出する。"""
-    today = date.today()
-    current_year = today.year
+@dataclass(frozen=True)
+class DateRange:
+    start: date
+    end: date
+    kind: str  # "explicit"(明示的な日付) | "recency"(「最近」等の曖昧表現)
+    matched_text: str  # クエリ中でマッチした文字列(UI表示・キーワード除去用)
 
-    if "今日" in query:
-        return (today, today)
-    if "昨日" in query:
-        y = today - timedelta(days=1)
-        return (y, y)
-    if "一昨日" in query or "おととい" in query:
+
+def _month_range(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year, 12, 31)
+    else:
+        end = date(year, month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def _shift_months(base: date, months_back: int) -> tuple[int, int]:
+    """monthsBackヶ月前の(年, 月)を正確に求める。"""
+    idx = base.year * 12 + (base.month - 1) - months_back
+    return idx // 12, idx % 12 + 1
+
+
+def parse_date_from_query(query: str, today: Optional[date] = None) -> Optional[DateRange]:
+    """クエリから日付範囲を抽出する。より具体的な表現を優先する。"""
+    today = today or date.today()
+    q = query or ""
+
+    # --- 完全な年月日 (2026年7月28日 / 2026/7/28 / 2026-07-28) ---
+    m = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", q)
+    if m:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return DateRange(d, d, "explicit", m.group(0))
+        except ValueError:
+            pass
+
+    # --- 年月 (2026年7月 / 2026/7) ---
+    m = re.search(r"(\d{4})[年/\-](\d{1,2})月?(?![\d/\-])", q)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12:
+            s, e = _month_range(year, month)
+            return DateRange(s, e, "explicit", m.group(0))
+
+    # --- 月日 (7月28日 / 7/28)。未来なら前年扱い ---
+    m = re.search(r"(\d{1,2})[月/\-](\d{1,2})日?", q)
+    if m:
+        try:
+            month, day = int(m.group(1)), int(m.group(2))
+            d = date(today.year, month, day)
+            if d > today:
+                d = date(today.year - 1, month, day)
+            return DateRange(d, d, "explicit", m.group(0))
+        except ValueError:
+            pass
+
+    # --- 月のみ (7月)。未来の月なら前年扱い ---
+    m = re.search(r"(?<![\d/\-])(\d{1,2})月(?![\d/\-])", q)
+    if m:
+        month = int(m.group(1))
+        if 1 <= month <= 12:
+            year = today.year if month <= today.month else today.year - 1
+            s, e = _month_range(year, month)
+            return DateRange(s, e, "explicit", m.group(0))
+
+    # --- 相対表現(固定語) ---
+    fixed: list[tuple[str, tuple[date, date]]] = []
+    if "今日" in q:
+        fixed.append(("今日", (today, today)))
+    if "一昨日" in q or "おととい" in q:
         d = today - timedelta(days=2)
-        return (d, d)
-    if "今週" in query:
+        fixed.append(("一昨日" if "一昨日" in q else "おととい", (d, d)))
+    elif "昨日" in q:
+        d = today - timedelta(days=1)
+        fixed.append(("昨日", (d, d)))
+    if "今週" in q:
         start = today - timedelta(days=today.weekday())
-        end = start + timedelta(days=6)
-        return (start, min(end, today))
-    if "先週" in query:
+        fixed.append(("今週", (start, today)))
+    if "先週" in q:
         start = today - timedelta(days=today.weekday() + 7)
-        end = start + timedelta(days=6)
-        return (start, end)
-    if "今月" in query:
-        start = today.replace(day=1)
-        return (start, today)
-    if "先月" in query:
-        first = today.replace(day=1)
-        last_month_end = first - timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-        return (last_month_start, last_month_end)
+        fixed.append(("先週", (start, start + timedelta(days=6))))
+    if "今月" in q:
+        fixed.append(("今月", (today.replace(day=1), today)))
+    if "先月" in q:
+        y, mo = _shift_months(today, 1)
+        fixed.append(("先月", _month_range(y, mo)))
+    if "去年" in q or "昨年" in q:
+        y = today.year - 1
+        fixed.append(("去年" if "去年" in q else "昨年", (date(y, 1, 1), date(y, 12, 31))))
+    elif "今年" in q:
+        fixed.append(("今年", (date(today.year, 1, 1), today)))
+    if fixed:
+        text, (s, e) = fixed[0]
+        return DateRange(s, e, "explicit", text)
 
-    days_ago = re.search(r"(\d+)\s*日前", query)
-    if days_ago:
-        n = int(days_ago.group(1))
-        target = today - timedelta(days=n)
-        return (target, target)
+    # --- N日前 / N週間前 / Nヶ月前 ---
+    m = re.search(r"(\d+)\s*日前", q)
+    if m:
+        d = today - timedelta(days=int(m.group(1)))
+        return DateRange(d, d, "explicit", m.group(0))
+    m = re.search(r"(\d+)\s*週間?前", q)
+    if m:
+        end = today - timedelta(weeks=int(m.group(1)))
+        return DateRange(end - timedelta(days=6), end, "explicit", m.group(0))
+    m = re.search(r"(\d+)\s*[ヶかカケ箇]?月前", q)
+    if m:
+        y, mo = _shift_months(today, int(m.group(1)))
+        s, e = _month_range(y, mo)
+        return DateRange(s, e, "explicit", m.group(0))
 
-    weeks_ago = re.search(r"(\d+)\s*週間?前", query)
-    if weeks_ago:
-        n = int(weeks_ago.group(1))
-        target_end = today - timedelta(weeks=n)
-        target_start = target_end - timedelta(days=6)
-        return (target_start, target_end)
-
-    months_ago = re.search(r"(\d+)\s*[ヶか]?月前", query)
-    if months_ago:
-        n = int(months_ago.group(1))
-        target = today - timedelta(days=30 * n)
-        month_start = target.replace(day=1)
-        if target.month == 12:
-            month_end = target.replace(day=31)
+    # --- 期間幅 (この2週間 / 過去10日間 / ここ3ヶ月) ---
+    m = re.search(r"(?:この|ここ|過去|直近|最近)\s*[（(]?\s*(\d+)\s*(日|週間|[ヶかカケ箇]?月)\s*[)）]?", q)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("日"):
+            days = n
+        elif unit.startswith("週"):
+            days = n * 7
         else:
-            month_end = target.replace(month=target.month + 1, day=1) - timedelta(days=1)
-        return (month_start, month_end)
+            days = n * 30
+        return DateRange(today - timedelta(days=days), today, "explicit", m.group(0))
 
-    full_date = re.search(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", query)
-    if full_date:
-        try:
-            year = int(full_date.group(1))
-            month = int(full_date.group(2))
-            day = int(full_date.group(3))
-            target = date(year, month, day)
-            return (target, target)
-        except ValueError:
-            pass
-
-    month_day = re.search(r"(\d{1,2})[月/\-](\d{1,2})日?", query)
-    if month_day:
-        try:
-            month = int(month_day.group(1))
-            day = int(month_day.group(2))
-            target = date(current_year, month, day)
-            if target > today:
-                target = date(current_year - 1, month, day)
-            return (target, target)
-        except ValueError:
-            pass
+    # --- 曖昧な「最近」系 ---
+    m = re.search(r"最近|直近|近頃|ここのところ", q)
+    if m:
+        return DateRange(today - timedelta(days=RECENCY_DAYS), today, "recency", m.group(0))
 
     return None
 
 
-def highlight_date_in_query(query: str) -> str:
-    """クエリ内の日付表現をStreamlit用にハイライトする。"""
-    result = query
-
-    def wrap(match: re.Match) -> str:
-        return f":orange[{match.group(0)}]"
-
-    relative_patterns = [
-        r"今日",
-        r"昨日",
-        r"一昨日",
-        r"おととい",
-        r"今週",
-        r"先週",
-        r"今月",
-        r"先月",
-        r"\d+\s*日前",
-        r"\d+\s*週間?前",
-        r"\d+\s*[ヶか]?月前",
-    ]
-
-    for pattern in relative_patterns:
-        result = re.sub(pattern, wrap, result)
-
-    result = re.sub(r"(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?", wrap, result)
-    result = re.sub(r"(\d{1,2})[月/\-](\d{1,2})日?", wrap, result)
-
-    return result
-
-
-def filter_matches_by_date(matches: List[Dict], date_range: Tuple[date, date]) -> List[Dict]:
-    """検索結果を指定日付でフィルタリングする。"""
-    start_date, end_date = date_range
-    filtered = []
-    for m in matches:
-        recorded_at = m.get("recorded_at")
-        if not recorded_at:
-            continue
-        if isinstance(recorded_at, str):
-            try:
-                recorded_date = datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).date()
-            except (ValueError, TypeError):
-                try:
-                    recorded_date = datetime.strptime(recorded_at[:10], "%Y-%m-%d").date()
-                except (ValueError, TypeError):
-                    continue
-        elif isinstance(recorded_at, datetime):
-            recorded_date = recorded_at.date()
-        elif isinstance(recorded_at, date):
-            recorded_date = recorded_at
-        else:
-            continue
-
-        if start_date <= recorded_date <= end_date:
-            filtered.append(m)
-    return filtered
+def highlight_date_in_query(query: str, today: Optional[date] = None) -> str:
+    """クエリ内の日付表現をStreamlit表示用にハイライトする。"""
+    dr = parse_date_from_query(query, today)
+    if not dr or not dr.matched_text:
+        return query
+    return query.replace(dr.matched_text, f":orange[{dr.matched_text}]", 1)

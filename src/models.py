@@ -81,6 +81,9 @@ class AudioTranscription(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     file_path = Column(String(500), nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
+    # 正規化済みの録音日(JST, 'YYYY-MM-DD')。created_atはWeb版(naive JST)と
+    # デスクトップ版(UTC RFC3339)で形式が異なるため、検索はこの列で行う。
+    recorded_date = Column(String(10), nullable=True, index=True)
     duration_seconds = Column(Float, nullable=False)
     transcript = Column(Text, nullable=False)
     structured_json = Column(JSON, nullable=True)
@@ -114,6 +117,7 @@ class CeoTranscription(Base):
     title = Column(String(500), nullable=True)
     speaker = Column(String(200), nullable=True)
     recorded_at = Column(String(64), nullable=True)
+    recorded_date = Column(String(10), nullable=True, index=True)
     model_id = Column(String(100), nullable=True)
     language_code = Column(String(10), nullable=True)
     transcript = Column(Text, nullable=False)
@@ -164,10 +168,6 @@ class LibSQLF32Vector(UserDefinedType):
     @property
     def python_type(self):  # type: ignore[override]
         return list
-
-    def _compiler_dispatch(self, visitor, **kw):  # pragma: no cover - dialect固有
-        """型のコンパイル処理をF32_BLOBにフォールバック。"""
-        return visitor.visit_user_defined_type(self, **kw)
 
 
 def _vector_to_f32_blob(values: Sequence[float], dimension: int) -> bytes:
@@ -223,6 +223,26 @@ class AudioTranscriptionChunk(Base):
     transcription = relationship("AudioTranscription", back_populates="chunks")
 
 
+class CeoTranscriptionChunk(Base):
+    """社長音声のRAG索引用チャンク。audio側と同じ構造。"""
+
+    __tablename__ = 'ceo_transcription_chunks'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    transcription_id = Column(
+        Integer,
+        ForeignKey('ceo_transcriptions.id', ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index = Column(Integer, nullable=False)
+    chunk_text = Column(Text, nullable=False)
+    if VECTOR_BACKEND == "libsql":
+        embedding = Column(LibSQLF32Vector(EMBEDDING_DIM), nullable=False)
+    else:
+        embedding = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class RAGChatLog(Base):
     __tablename__ = 'rag_chat_logs'
 
@@ -236,8 +256,20 @@ class RAGChatLog(Base):
     alpha = Column(Float, nullable=True)
     date_filter_applied = Column(Boolean, default=False, nullable=True)  # 日付フィルタ適用有無
 
+def _tolerant_json_loads(value):
+    """JSON列の読み出し。デスクトップ版が空文字列等の不正JSONを書き込む
+    ことがあるため、パース失敗時はNoneを返してアプリを止めない。"""
+    import json as _json
+
+    try:
+        return _json.loads(value)
+    except (ValueError, TypeError):
+        logger.warning("JSON列のパースに失敗したためNoneとして扱います: %r", value[:80] if isinstance(value, str) else value)
+        return None
+
+
 # データベース接続設定
-engine_kwargs = dict(echo=False)
+engine_kwargs = dict(echo=False, json_deserializer=_tolerant_json_loads)
 if IS_LIBSQL:
     engine_kwargs["pool_pre_ping"] = True
 
@@ -293,9 +325,12 @@ def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
         logger.warning("%s のカラム追加に失敗: %s", table_name, exc)
 
 
+_ensure_columns("audio_transcriptions", {"recorded_date": "TEXT"})
+
 _ensure_columns(
     "ceo_transcriptions",
     {
+        "recorded_date": "TEXT",
         "file_path": "TEXT",
         "local_file_path": "TEXT",
         "source_file_path": "TEXT",
@@ -320,11 +355,27 @@ _ensure_columns(
 # セッション作成
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# RAG検索用のFTS5テーブル名(バイグラム索引テキストをPython側で管理)
+RAG_FTS_TABLES = {
+    "audio": "rag_fts_audio",
+    "ceo": "rag_fts_ceo",
+}
+CEO_VECTOR_INDEX_NAME = "ceo_transcription_chunks_embedding_idx"
+
 if IS_LIBSQL:
     _t2 = time.time()
     try:
         with engine.begin() as connection:
-            # ベクトル式インデックス（正しい構文: USING ではなく式）
+            # 旧FTS(unicode61: 日本語でBM25が機能しない)とトリガを撤去
+            for trig in (
+                "audio_transcription_chunks_ai",
+                "audio_transcription_chunks_ad",
+                "audio_transcription_chunks_au",
+            ):
+                connection.execute(text(f"DROP TRIGGER IF EXISTS {trig}"))
+            connection.execute(text("DROP TABLE IF EXISTS audio_transcription_chunks_fts"))
+
+            # ベクトル式インデックス
             connection.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS "
@@ -332,76 +383,35 @@ if IS_LIBSQL:
                     "ON audio_transcription_chunks(libsql_vector_idx(embedding))"
                 )
             )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    f"{CEO_VECTOR_INDEX_NAME} "
+                    "ON ceo_transcription_chunks(libsql_vector_idx(embedding))"
+                )
+            )
 
-            # RAG用の補助インデックス（削除・再作成の高速化）
+            # RAG用の補助インデックス
             connection.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_chunks_by_transcription "
                     "ON audio_transcription_chunks(transcription_id, chunk_index)"
                 )
             )
-
-            # FTS5（ハイブリッド検索用）。コンテンツ同期型 + トリガで追従
             connection.execute(
                 text(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS audio_transcription_chunks_fts "
-                    "USING fts5(\n"
-                    "  chunk_text,\n"
-                    "  content='audio_transcription_chunks',\n"
-                    "  content_rowid='id',\n"
-                    "  tokenize='unicode61'\n"
-                    ")"
+                    "CREATE INDEX IF NOT EXISTS idx_ceo_chunks_by_transcription "
+                    "ON ceo_transcription_chunks(transcription_id, chunk_index)"
                 )
             )
 
-            # 追従トリガ
-            connection.execute(
-                text(
-                    "CREATE TRIGGER IF NOT EXISTS audio_transcription_chunks_ai "
-                    "AFTER INSERT ON audio_transcription_chunks BEGIN\n"
-                    "  INSERT INTO audio_transcription_chunks_fts(rowid, chunk_text) VALUES (new.id, new.chunk_text);\n"
-                    "END;"
-                )
-            )
-
-            connection.execute(
-                text(
-                    "CREATE TRIGGER IF NOT EXISTS audio_transcription_chunks_ad "
-                    "AFTER DELETE ON audio_transcription_chunks BEGIN\n"
-                    "  INSERT INTO audio_transcription_chunks_fts(audio_transcription_chunks_fts, rowid) VALUES('delete', old.id);\n"
-                    "END;"
-                )
-            )
-
-            connection.execute(
-                text(
-                    "CREATE TRIGGER IF NOT EXISTS audio_transcription_chunks_au "
-                    "AFTER UPDATE ON audio_transcription_chunks BEGIN\n"
-                    "  INSERT INTO audio_transcription_chunks_fts(audio_transcription_chunks_fts, rowid) VALUES('delete', old.id);\n"
-                    "  INSERT INTO audio_transcription_chunks_fts(rowid, chunk_text) VALUES (new.id, new.chunk_text);\n"
-                    "END;"
-                )
-            )
-
-            # 'rebuild' は高コストのため、必要時のみ実行する
-            # 条件: FTSテーブルが空 かつ 基表にデータがある場合のみ
-            try:
-                fts_count = connection.execute(
-                    text("SELECT COUNT(*) FROM audio_transcription_chunks_fts")
-                ).scalar()
-            except Exception:
-                fts_count = 0
-            try:
-                base_count = connection.execute(
-                    text("SELECT COUNT(*) FROM audio_transcription_chunks")
-                ).scalar()
-            except Exception:
-                base_count = 0
-
-            if (fts_count or 0) == 0 and (base_count or 0) > 0:
+            # FTS5(バイグラム方式)。rowid=チャンクid。行の追従はアプリ側の
+            # インデックス処理・再同期処理(services/rag/reconcile.py)が行う。
+            for fts_name in RAG_FTS_TABLES.values():
                 connection.execute(
                     text(
-                        "INSERT INTO audio_transcription_chunks_fts(audio_transcription_chunks_fts) VALUES('rebuild')"
+                        f"CREATE VIRTUAL TABLE IF NOT EXISTS {fts_name} "
+                        "USING fts5(tokens, tokenize='unicode61')"
                     )
                 )
     except Exception as exc:  # pragma: no cover - 初期化時の警告

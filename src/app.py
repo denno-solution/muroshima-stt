@@ -86,7 +86,7 @@ tab1, tab2, tab_ceo, tab3, tab4, tab_ceo_db, tab5 = st.tabs([
     "📊 処理結果",
     "🗄️ データベース",
     "📂 社長音声履歴",
-    "💬 QA検索",
+    "💬 音声DBに質問",
 ])
 with tab1:
     run_upload_tab(selected_model, use_structuring, logger)

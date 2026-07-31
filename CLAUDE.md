@@ -190,9 +190,15 @@ uv lock --upgrade
 
 ## Agent Notes（RAG開発向けメモ）
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
-- DB関連の実装・最適化はlibSQLのベクトル関数（`vector_top_k`, `vector_distance_cos`, `libsql_vector_idx`）とFTS5のみを前提にしてください。
+- QA検索（「音声DBに質問」タブ）のアーキテクチャ:
+  - `services/rag/search_service.py`: 検索実行層。ベクトル検索（`vector_distance_cos`全走査+SQL日付フィルタ）/ キーワード検索（FTS5）/ 期間ブラウズの3操作。Phase 2（agentic search）ではこれらをLLMのツールとして公開する想定
+  - `services/rag/tokenizer.py`: FTS5用の文字バイグラムトークナイザ。索引テーブルは`rag_fts_audio`/`rag_fts_ceo`（Python側で行を管理、トリガ無し）。現場用語・型番の完全一致検索を辞書非依存で保証
+  - `services/rag/date_utils.py`: クエリからの日付範囲抽出。検索は正規化済み`recorded_date`列（JST, YYYY-MM-DD）へのSQL WHEREで行う（事後フィルタ禁止）
+  - `services/rag/context_builder.py`: コンテキストは録音単位（短い録音は全文、長い録音はヒット周辺の結合）。チャンク断片をそのまま渡さない
+  - `services/rag/reconcile.py` + `RAGService.reconcile()`: デスクトップ版保存分・社長音声の索引差分を補完。UIから自動/ボタン実行、CLIは`scripts/backfill_rag.py`
+- ハイブリッド検索の融合は重み付きRRF（Reciprocal Rank Fusion）。スコアの絶対値でのブレンドはキャリブレーション問題があるため禁止
+- `created_at`はWeb版（naive UTC）とデスクトップ版（RFC3339 UTC）で形式が混在。日付判定には必ず`recorded_date`を使う
 - QA検索タブの回答生成は「ストリーミングのみ」です。非ストリーミングAPIはコードから撤去済みです。
 - 既定のRAGモデル: `EMBEDDING_MODEL=text-embedding-3-small (1536次元)`, `RAG_COMPLETION_MODEL=gpt-5.6-luna`。Responses APIを使用。
 - `EMBEDDING_DIM` を変更する場合はDB列定義が固定のため、再作成（既存チャンク削除→再インデックス）が必要。
-- プロンプトは番号付きコンテキスト＋出典必須（[#番号]）で構成。回答/根拠/不足情報の3セクション出力を期待。
-- 温度は既定値（未指定）。再現性が要る場合は `.env` で上書きではなくプロンプト・候補件数を調整する。
+- 検索品質の確認は `uv run python scripts/eval_rag.py "質問"`（検索計画と参照録音を表示。生成なし）。
