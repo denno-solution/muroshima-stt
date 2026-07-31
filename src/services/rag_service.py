@@ -399,7 +399,8 @@ class RAGService:
             whole_doc_threshold=WHOLE_DOC_THRESHOLD,
             order=order,
         )
-        messages = build_chat_messages(query, docs, chat_history, today)
+        corpus = "ceo" if tuple(plan.sources) == ("ceo",) else "audio"
+        messages = build_chat_messages(query, docs, chat_history, today, corpus=corpus)
         t2 = time.time()
 
         client = self._client

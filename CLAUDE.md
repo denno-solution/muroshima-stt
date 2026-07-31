@@ -185,12 +185,14 @@ uv lock --upgrade
 - RAG機能は Turso(libSQL) 専用です（Postgres対応は削除）。
 - `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-small), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
-- Streamlit UIに「💬 QA検索」タブがあり、検索件数スライダーとチャット履歴表示、参照チャンクのスコア/メタ情報の閲覧が可能。
+- Streamlit UIのQAチャットは「💬 現場録音に質問」「💬 社長音声に質問」の2タブに分離（検索エンジンは共通、検索対象・会話履歴・プロンプトが別）。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
 ## Agent Notes（RAG開発向けメモ）
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
-- QA検索（「音声DBに質問」タブ）のアーキテクチャ:
+- QAチャット（「現場録音に質問」「社長音声に質問」タブ）のアーキテクチャ:
+  - 出口は現場録音用と社長音声用で分離（`ui/tabs/rag_tab.py`の`_ChatProfile`）。会話ログは`rag_chat_logs.chat_kind`（"audio"/"ceo"、NULLは旧データ=audio扱い）で区別
+  - 新規保存分は保存時に即時索引化（現場録音: upload_tab/mic_tab、社長音声: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
   - `services/rag/search_service.py`: 検索実行層。ベクトル検索（`vector_distance_cos`全走査+SQL日付フィルタ）/ キーワード検索（FTS5）/ 期間ブラウズの3操作。Phase 2（agentic search）ではこれらをLLMのツールとして公開する想定
   - `services/rag/tokenizer.py`: FTS5用の文字バイグラムトークナイザ。索引テーブルは`rag_fts_audio`/`rag_fts_ceo`（Python側で行を管理、トリガ無し）。現場用語・型番の完全一致検索を辞書非依存で保証
   - `services/rag/date_utils.py`: クエリからの日付範囲抽出。検索は正規化済み`recorded_date`列（JST, YYYY-MM-DD）へのSQL WHEREで行う（事後フィルタ禁止）

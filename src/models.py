@@ -248,6 +248,7 @@ class RAGChatLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(36), nullable=True, index=True)  # セッション管理用UUID
+    chat_kind = Column(String(20), nullable=True)  # "audio"(現場録音) / "ceo"(社長音声)。NULLは旧データ=audio扱い
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     user_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=True)
@@ -326,6 +327,8 @@ def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
 
 
 _ensure_columns("audio_transcriptions", {"recorded_date": "TEXT"})
+
+_ensure_columns("rag_chat_logs", {"chat_kind": "TEXT"})
 
 _ensure_columns(
     "ceo_transcriptions",

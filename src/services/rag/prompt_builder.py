@@ -10,11 +10,18 @@ from services.rag.context_builder import ContextDoc
 _SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
 
 
-def build_system_prompt(today: Optional[date] = None) -> str:
+_CORPUS_DESCRIPTIONS = {
+    "audio": "現場の作業録音を文字起こしした「音声DB」",
+    "ceo": "社長が録音した音声メモ・打ち合わせを文字起こしした「社長音声DB」",
+}
+
+
+def build_system_prompt(today: Optional[date] = None, corpus: str = "audio") -> str:
     today_str = (today or date.today()).isoformat()
+    corpus_desc = _CORPUS_DESCRIPTIONS.get(corpus, _CORPUS_DESCRIPTIONS["audio"])
     return (
         "あなたは射出成形工場の社内アシスタントです。"
-        "現場の録音を文字起こしした「音声DB」から検索した内容(コンテキスト)に基づいて質問に答えます。\n"
+        f"{corpus_desc}から検索した内容(コンテキスト)に基づいて質問に答えます。\n"
         f"今日の日付: {today_str}\n"
         "ルール:\n"
         "- 事実は必ずコンテキストに基づき、該当する録音番号 [#n] を出典として示す\n"
@@ -48,8 +55,9 @@ def build_chat_messages(
     docs: List[ContextDoc],
     chat_history: Optional[List[Dict]] = None,
     today: Optional[date] = None,
+    corpus: str = "audio",
 ) -> List[Dict]:
-    messages: List[Dict] = [{"role": "system", "content": build_system_prompt(today)}]
+    messages: List[Dict] = [{"role": "system", "content": build_system_prompt(today, corpus)}]
 
     if chat_history:
         for msg in chat_history[-10:]:

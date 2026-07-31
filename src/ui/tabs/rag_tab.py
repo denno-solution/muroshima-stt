@@ -1,9 +1,15 @@
-"""音声DBへの質問(QA検索)タブ。"""
+"""音声DBへの質問(QAチャット)タブ。
+
+現場録音用(run_rag_tab)と社長音声用(run_ceo_rag_tab)で出口を分離している。
+検索エンジン(RAGService)は共通で、検索対象・会話履歴・プロンプトが
+プロファイル単位で切り替わる。
+"""
 
 import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -16,24 +22,51 @@ from services.rag_service import get_rag_service
 
 logger = logging.getLogger(__name__)
 
-_SOURCE_OPTIONS: Dict[str, Tuple[str, ...]] = {
-    "現場録音": ("audio",),
-    "社長音声": ("ceo",),
-    "すべて": ("audio", "ceo"),
-}
 _SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
 
 # 自動インデックスを黙って実行する上限(超える場合はボタンで明示実行)
-_AUTO_INDEX_LIMIT = 5
+_AUTO_INDEX_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _ChatProfile:
+    """QAチャットの出口ごとの設定。現場録音と社長音声で会話・検索対象を分離する。"""
+
+    key: str  # session_state・ウィジェットkey・chat_kindの識別子("audio"/"ceo")
+    sources: Tuple[str, ...]
+    header: str
+    placeholder: str
+
+
+_AUDIO_PROFILE = _ChatProfile(
+    key="audio",
+    sources=("audio",),
+    header="💬 現場録音に質問",
+    placeholder="質問を入力（例: 7/28の作業内容は？ / ボイドが出たとき過去はどう対処した？）",
+)
+_CEO_PROFILE = _ChatProfile(
+    key="ceo",
+    sources=("ceo",),
+    header="💬 社長音声に質問",
+    placeholder="質問を入力（例: 最近の録音の内容をまとめて / 〇〇の件はどういう話だった？）",
+)
 
 
 # ----------------------------------------------------------------------
 # セッション管理
 # ----------------------------------------------------------------------
-def _get_or_create_session_id() -> str:
-    if "rag_session_id" not in st.session_state:
-        st.session_state.rag_session_id = str(uuid.uuid4())
-    return st.session_state.rag_session_id
+def _get_or_create_session_id(profile: _ChatProfile) -> str:
+    key = f"rag_{profile.key}_session_id"
+    if key not in st.session_state:
+        st.session_state[key] = str(uuid.uuid4())
+    return st.session_state[key]
+
+
+def _kind_filter(profile: _ChatProfile):
+    """会話ログの出口別フィルタ。旧データ(chat_kind=NULL)は現場録音として扱う。"""
+    if profile.key == "ceo":
+        return RAGChatLog.chat_kind == "ceo"
+    return or_(RAGChatLog.chat_kind == "audio", RAGChatLog.chat_kind.is_(None))
 
 
 def _load_session_history(session_id: str) -> List[Dict]:
@@ -60,7 +93,7 @@ def _load_session_history(session_id: str) -> List[Dict]:
         db.close()
 
 
-def _fetch_session_summaries(keyword: str = "", limit: int = 20):
+def _fetch_session_summaries(profile: _ChatProfile, keyword: str = "", limit: int = 20):
     db = next(get_db())
     try:
         session_ids_subq = None
@@ -68,6 +101,7 @@ def _fetch_session_summaries(keyword: str = "", limit: int = 20):
             session_ids_subq = (
                 db.query(RAGChatLog.session_id)
                 .filter(RAGChatLog.session_id.isnot(None))
+                .filter(_kind_filter(profile))
                 .filter(
                     or_(
                         RAGChatLog.user_text.contains(keyword),
@@ -86,6 +120,7 @@ def _fetch_session_summaries(keyword: str = "", limit: int = 20):
                 func.count(RAGChatLog.id).label("message_count"),
             )
             .filter(RAGChatLog.session_id.isnot(None))
+            .filter(_kind_filter(profile))
         )
         if session_ids_subq is not None:
             base = base.filter(RAGChatLog.session_id.in_(select(session_ids_subq.c.session_id)))
@@ -111,10 +146,15 @@ def _fetch_session_summaries(keyword: str = "", limit: int = 20):
         db.close()
 
 
-def _render_session_picker(session_id: str) -> None:
+def _render_session_picker(profile: _ChatProfile, session_id: str) -> None:
     with st.popover("🗂 過去の会話", use_container_width=True):
-        kw = st.text_input("キーワードで検索", value="", placeholder="例: ヒケ 保圧", key="rag_session_kw")
-        sessions = _fetch_session_summaries(keyword=kw, limit=15)
+        kw = st.text_input(
+            "キーワードで検索",
+            value="",
+            placeholder="例: ヒケ 保圧",
+            key=f"rag_{profile.key}_session_kw",
+        )
+        sessions = _fetch_session_summaries(profile, keyword=kw, limit=15)
         if not sessions:
             st.caption("保存された会話はありません。")
         for s in sessions:
@@ -125,12 +165,12 @@ def _render_session_picker(session_id: str) -> None:
             updated = str(s.last_updated)[:16]
             if st.button(
                 f"{prefix}{title}",
-                key=f"resume_{s.session_id}",
+                key=f"rag_{profile.key}_resume_{s.session_id}",
                 help=f"{updated} / {s.message_count}件のメッセージ",
                 use_container_width=True,
             ):
-                st.session_state.rag_session_id = s.session_id
-                st.session_state.rag_history = _load_session_history(s.session_id)
+                st.session_state[f"rag_{profile.key}_session_id"] = s.session_id
+                st.session_state[f"rag_{profile.key}_history"] = _load_session_history(s.session_id)
                 st.rerun()
 
 
@@ -207,8 +247,24 @@ def _handle_rag_error(error: Exception, context: str = ""):
 # ----------------------------------------------------------------------
 # インデックス状態
 # ----------------------------------------------------------------------
-def _ensure_index(rag) -> None:
-    """索引の差分を検出し、軽い処理は自動で、重い処理は明示実行で補完する。"""
+@st.cache_data(ttl=30, show_spinner=False)
+def _corpus_snapshot() -> Tuple[Dict, Dict]:
+    """コーパス統計と未索引件数。タブ2つ分の再照会を防ぐため30秒キャッシュする。"""
+    rag = get_rag_service()
+    db = next(get_db())
+    try:
+        return rag.corpus_stats(db), rag.pending_counts(db)
+    finally:
+        db.close()
+
+
+def _ensure_index(rag, profile: _ChatProfile, pending: Dict[str, int]) -> None:
+    """索引の差分を検出し、軽い処理は自動で、重い処理は明示実行で補完する。
+
+    デスクトップ版などWeb以外の経路で保存されたデータもここで検索対象に取り込む。
+    _AUTO_INDEX_LIMIT件以下なら開いたときに自動実行するため、通常運用では
+    ユーザー操作なしで新しいデータが検索できるようになる。
+    """
     if "rag_light_reconciled" not in st.session_state:
         db = next(get_db())
         try:
@@ -219,11 +275,6 @@ def _ensure_index(rag) -> None:
         finally:
             db.close()
 
-    db = next(get_db())
-    try:
-        pending = rag.pending_counts(db)
-    finally:
-        db.close()
     total = sum(pending.values())
     if total == 0:
         return
@@ -245,6 +296,7 @@ def _ensure_index(rag) -> None:
                 )
         finally:
             db2.close()
+        _corpus_snapshot.clear()
         st.rerun()
 
     if total <= _AUTO_INDEX_LIMIT:
@@ -256,7 +308,11 @@ def _ensure_index(rag) -> None:
             "デスクトップ版で保存されたデータ等が該当します。"
             "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
         )
-        if st.button(f"今すぐインデックス化する（約{max(1, total // 100)}〜{max(2, total // 50)}分）", type="primary"):
+        if st.button(
+            f"今すぐインデックス化する（約{max(1, total // 100)}〜{max(2, total // 50)}分）",
+            type="primary",
+            key=f"rag_{profile.key}_reindex_btn",
+        ):
             _run_indexing()
 
 
@@ -264,7 +320,17 @@ def _ensure_index(rag) -> None:
 # メイン
 # ----------------------------------------------------------------------
 def run_rag_tab():
-    st.header("💬 音声DBに質問")
+    """現場録音への質問タブ。"""
+    _run_chat(_AUDIO_PROFILE)
+
+
+def run_ceo_rag_tab():
+    """社長音声への質問タブ。"""
+    _run_chat(_CEO_PROFILE)
+
+
+def _run_chat(profile: _ChatProfile):
+    st.header(profile.header)
 
     rag = get_rag_service()
 
@@ -278,39 +344,28 @@ def run_rag_tab():
             st.warning("OPENAI_API_KEY が未設定のためQA検索を利用できません。")
         return
 
-    session_id = _get_or_create_session_id()
-    if "rag_history" not in st.session_state:
-        st.session_state.rag_history = []
+    session_id = _get_or_create_session_id(profile)
+    hist_key = f"rag_{profile.key}_history"
+    if hist_key not in st.session_state:
+        st.session_state[hist_key] = []
 
-    # --- コーパス統計 ---
-    db = next(get_db())
-    try:
-        stats = rag.corpus_stats(db)
-    finally:
-        db.close()
-    audio_s, ceo_s = stats.get("audio", {}), stats.get("ceo", {})
+    # --- コーパス統計と索引状態 ---
+    stats, pending = _corpus_snapshot()
+    src = profile.sources[0]
+    s = stats.get(src, {})
     st.caption(
-        f"検索対象データ: 現場録音 **{audio_s.get('count', 0)}件**"
-        f"（最新 {audio_s.get('latest') or '—'}） / "
-        f"社長音声 **{ceo_s.get('count', 0)}件**（最新 {ceo_s.get('latest') or '—'}）"
+        f"検索対象: {_SOURCE_LABELS[src]} **{s.get('count', 0)}件**"
+        f"（最新の録音日 {s.get('latest') or '—'}）"
     )
 
-    _ensure_index(rag)
+    _ensure_index(rag, profile, pending)
 
     # --- 検索条件 ---
-    ctrl_cols = st.columns([2.2, 1.6, 1.1, 1.1])
-    with ctrl_cols[0]:
-        source_label = st.segmented_control(
-            "検索対象",
-            list(_SOURCE_OPTIONS.keys()),
-            default="現場録音",
-            key="rag_sources",
-            label_visibility="collapsed",
-        )
+    ctrl_cols = st.columns([1.8, 1.1, 1.1])
     manual_range: Optional[Tuple[date, date]] = None
-    with ctrl_cols[1]:
-        d_from = st.session_state.get("rag_date_from")
-        d_to = st.session_state.get("rag_date_to")
+    with ctrl_cols[0]:
+        d_from = st.session_state.get(f"rag_{profile.key}_date_from")
+        d_to = st.session_state.get(f"rag_{profile.key}_date_to")
         period_label = (
             f"📅 {d_from} 〜 {d_to}" if (d_from and d_to) else "📅 期間: 自動判定"
         )
@@ -318,29 +373,36 @@ def run_rag_tab():
             st.caption("通常は質問文から自動判定します（「7/28の作業」「先月の記録」等）。固定したい場合のみ指定してください。")
             c1, c2 = st.columns(2)
             with c1:
-                d_from = st.date_input("開始日", value=d_from, key="rag_date_from_input", format="YYYY-MM-DD")
+                d_from = st.date_input(
+                    "開始日", value=d_from, key=f"rag_{profile.key}_date_from_input", format="YYYY-MM-DD"
+                )
             with c2:
-                d_to = st.date_input("終了日", value=d_to, key="rag_date_to_input", format="YYYY-MM-DD")
+                d_to = st.date_input(
+                    "終了日", value=d_to, key=f"rag_{profile.key}_date_to_input", format="YYYY-MM-DD"
+                )
             b1, b2 = st.columns(2)
             with b1:
-                if st.button("適用", use_container_width=True):
-                    st.session_state.rag_date_from = d_from
-                    st.session_state.rag_date_to = d_to
+                if st.button("適用", use_container_width=True, key=f"rag_{profile.key}_date_apply"):
+                    st.session_state[f"rag_{profile.key}_date_from"] = d_from
+                    st.session_state[f"rag_{profile.key}_date_to"] = d_to
                     st.rerun()
             with b2:
-                if st.button("解除（自動に戻す）", use_container_width=True):
-                    st.session_state.rag_date_from = None
-                    st.session_state.rag_date_to = None
+                if st.button("解除（自動に戻す）", use_container_width=True, key=f"rag_{profile.key}_date_clear"):
+                    st.session_state[f"rag_{profile.key}_date_from"] = None
+                    st.session_state[f"rag_{profile.key}_date_to"] = None
                     st.rerun()
-        if st.session_state.get("rag_date_from") and st.session_state.get("rag_date_to"):
-            manual_range = (st.session_state.rag_date_from, st.session_state.rag_date_to)
-    with ctrl_cols[2]:
-        if st.button("✨ 新規会話", use_container_width=True):
-            st.session_state.rag_session_id = str(uuid.uuid4())
-            st.session_state.rag_history = []
+        if st.session_state.get(f"rag_{profile.key}_date_from") and st.session_state.get(f"rag_{profile.key}_date_to"):
+            manual_range = (
+                st.session_state[f"rag_{profile.key}_date_from"],
+                st.session_state[f"rag_{profile.key}_date_to"],
+            )
+    with ctrl_cols[1]:
+        if st.button("✨ 新規会話", use_container_width=True, key=f"rag_{profile.key}_new_session"):
+            st.session_state[f"rag_{profile.key}_session_id"] = str(uuid.uuid4())
+            st.session_state[hist_key] = []
             st.rerun()
-    with ctrl_cols[3]:
-        _render_session_picker(session_id)
+    with ctrl_cols[2]:
+        _render_session_picker(profile, session_id)
 
     with st.expander("🔧 詳細設定", expanded=False):
         alpha = st.slider(
@@ -350,16 +412,16 @@ def run_rag_tab():
             value=0.6,
             step=0.05,
             help="1.0に近いほど意味的な類似(ベクトル検索)を、0.0に近いほどキーワード一致を重視します",
+            key=f"rag_{profile.key}_alpha",
         )
         max_docs = st.number_input(
             "参照する録音数の上限", min_value=1, max_value=15, value=6, step=1,
             help="回答の根拠として読み込む録音の最大件数",
+            key=f"rag_{profile.key}_max_docs",
         )
 
-    sources = _SOURCE_OPTIONS.get(source_label or "現場録音", ("audio",))
-
     # --- 会話履歴表示 ---
-    for message in st.session_state.rag_history:
+    for message in st.session_state[hist_key]:
         block = st.chat_message(message["role"])
         if message["role"] == "user":
             block.markdown(highlight_date_in_query(message["content"]))
@@ -369,18 +431,16 @@ def run_rag_tab():
                 with block.expander(f"参照した録音（{len(message['contexts'])}件）", expanded=False):
                     _render_context_docs(message["contexts"])
 
-    query = st.chat_input(
-        "質問を入力（例: 7/28の作業内容は？ / ボイドが出たとき過去はどう対処した？）"
-    )
+    query = st.chat_input(profile.placeholder, key=f"rag_{profile.key}_chat_input")
     if not query:
         return
 
-    st.session_state.rag_history.append({"role": "user", "content": query})
+    st.session_state[hist_key].append({"role": "user", "content": query})
     st.chat_message("user").markdown(highlight_date_in_query(query))
 
     chat_history_for_rag = [
         {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.rag_history[:-1]
+        for m in st.session_state[hist_key][:-1]
         if m["role"] in ("user", "assistant") and m.get("content")
     ]
 
@@ -390,7 +450,7 @@ def run_rag_tab():
             result = rag.answer_stream(
                 db,
                 query,
-                sources=sources,
+                sources=profile.sources,
                 manual_date_range=manual_range,
                 chat_history=chat_history_for_rag,
                 alpha=alpha,
@@ -431,7 +491,7 @@ def run_rag_tab():
     )
 
     # --- 履歴・ログ保存 ---
-    st.session_state.rag_history.append(
+    st.session_state[hist_key].append(
         {"role": "assistant", "content": full_text, "contexts": docs}
     )
 
@@ -453,6 +513,7 @@ def run_rag_tab():
     try:
         log = RAGChatLog(
             session_id=session_id,
+            chat_kind=profile.key,
             user_text=query,
             answer_text=full_text,
             contexts=contexts_json,
