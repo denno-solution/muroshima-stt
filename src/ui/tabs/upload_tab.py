@@ -1,4 +1,3 @@
-from datetime import datetime
 from pathlib import Path
 import tempfile
 import os
@@ -6,11 +5,12 @@ import pandas as pd
 import streamlit as st
 import librosa
 
-from models import AudioTranscription, get_db
+from models import AudioTranscription, get_db, utcnow_naive
 from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
 from services.rag_service import get_rag_service
 from services.vad import trim_non_speech
+from services.word_timestamps import build_word_timestamp_columns
 
 
 def run_upload_tab(selected_model: str, use_structuring: bool, logger):
@@ -69,10 +69,14 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                 vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: 2)())
                 stt_input_path = tmp_path
                 vad_note = None
+                vad_applied = False  # STT入力がVADトリム後音声か
+                vad_kept_ranges = None
                 if use_vad:
                     try:
                         vad_res = trim_non_speech(tmp_path, enabled=True, aggressiveness=vad_aggr)
                         stt_input_path = vad_res.output_path
+                        vad_applied = True
+                        vad_kept_ranges = vad_res.kept_ranges
                         reduced = 0.0
                         if vad_res.orig_sec > 0:
                             reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
@@ -83,13 +87,14 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                         logger.warning(f"VAD前処理に失敗したためスキップ: {e}")
                         st.warning("VAD前処理に失敗したため、元音声を使用します。")
                         stt_input_path = tmp_path
+                        vad_applied = False
+                        vad_kept_ranges = None
 
                 logger.info(f"文字起こし実行中: {uploaded_file.name} (モデル: {selected_model})")
-                transcription = stt_wrapper.transcribe(stt_input_path)
-
-                error_msg = None
-                if isinstance(transcription, tuple) and transcription[0] is None:
-                    error_msg = transcription[1]
+                stt_result = stt_wrapper.transcribe_detailed(stt_input_path)
+                transcription = stt_result.text
+                error_msg = stt_result.error
+                if error_msg:
                     transcription = None
                     logger.error(f"文字起こしエラー: {error_msg}")
 
@@ -101,9 +106,19 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                         if structured_data:
                             tags = text_structurer.extract_tags(structured_data)
 
+                    # 単語タイムスタンプ: STTが返したまま(VAD後基準)と、
+                    # VAD保持区間から元音声基準へ復元した値の両方を保存する
+                    word_ts, word_ts_original = build_word_timestamp_columns(
+                        stt_result.words,
+                        vad_applied=vad_applied,
+                        vad_ranges=vad_kept_ranges,
+                    )
+
+                    # created_atはnaive UTCで統一(desktop版と日付判定の互換のため)
+                    created_at = utcnow_naive()
                     result = {
                         "file_name": uploaded_file.name,
-                        "created_at": datetime.now(),
+                        "created_at": created_at,
                         "duration_seconds": duration,
                         "transcript": transcription,
                         "structured_json": structured_data,
@@ -116,11 +131,13 @@ def run_upload_tab(selected_model: str, use_structuring: bool, logger):
                     try:
                         audio_record = AudioTranscription(
                             file_path=uploaded_file.name,
-                            created_at=datetime.now(),
+                            created_at=created_at,
                             duration_seconds=duration,
                             transcript=transcription,
                             structured_json=structured_data,
                             tags=tags,
+                            word_timestamps_json=word_ts,
+                            word_timestamps_original_json=word_ts_original,
                         )
                         db.add(audio_record)
                         db.flush()

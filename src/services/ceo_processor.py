@@ -24,10 +24,11 @@ from typing import Optional
 
 from sqlalchemy import or_
 
-from models import CeoTranscription, get_db
+from models import CeoTranscription, get_db, utcnow_naive
 from services.audio_utils import get_audio_duration, get_audio_duration_metadata
 from services.rag_service import get_rag_service
 from services.vad import trim_non_speech
+from services.word_timestamps import build_word_timestamp_columns
 from stt_wrapper import STTModelWrapper
 
 
@@ -433,6 +434,8 @@ def process_ceo_uploaded_path(
 
         # 3. VAD（任意）
         stt_input_path = str(src)
+        vad_applied = False  # STT入力がVADトリム後音声か
+        vad_kept_ranges = None
         if use_vad and _should_apply_vad(
             file_path=str(src),
             size_bytes=source_file_size_bytes,
@@ -446,6 +449,8 @@ def process_ceo_uploaded_path(
                 )
                 vad_path = vad_res.output_path
                 stt_input_path = vad_path
+                vad_applied = True
+                vad_kept_ranges = vad_res.kept_ranges
                 original_duration = vad_res.orig_sec
                 if vad_res.orig_sec > 0:
                     reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
@@ -459,6 +464,8 @@ def process_ceo_uploaded_path(
                 logger.warning("CEO VAD 前処理に失敗したためスキップ: %s", exc)
                 _append_warning(result, f"VAD 前処理に失敗したため元音声を使用します: {exc}")
                 stt_input_path = str(src)
+                vad_applied = False
+                vad_kept_ranges = None
 
         # 4. VAD ファイルはマイク録音用の保存先（CEO_VAD_OUTPUT_DIR）にコピー保存
         if vad_path and os.path.exists(vad_path):
@@ -472,10 +479,10 @@ def process_ceo_uploaded_path(
 
         # 5. STT
         wrapper = STTModelWrapper(selected_model)
-        transcription = wrapper.transcribe(stt_input_path)
-        error_msg: Optional[str] = None
-        if isinstance(transcription, tuple) and transcription[0] is None:
-            error_msg = transcription[1] if len(transcription) > 1 else "STT failed"
+        stt_result = wrapper.transcribe_detailed(stt_input_path)
+        transcription = stt_result.text
+        error_msg: Optional[str] = stt_result.error
+        if error_msg:
             transcription = None
 
         if not transcription:
@@ -484,6 +491,14 @@ def process_ceo_uploaded_path(
             return result
 
         duration = original_duration or _safe_duration(str(src), stt_input_path)
+
+        # 単語タイムスタンプ: VAD後基準(STTが返したまま)と、VAD保持区間から
+        # 元音声基準へ復元した値の両方を保存する(desktopの作業録音と同方針)
+        word_ts, word_ts_original = build_word_timestamp_columns(
+            stt_result.words,
+            vad_applied=vad_applied,
+            vad_ranges=vad_kept_ranges,
+        )
 
         # 6. DB 保存
         db = next(get_db())
@@ -507,7 +522,10 @@ def process_ceo_uploaded_path(
                 structured_json=None,
                 duration_seconds=duration,
                 tags="社長音声",
-                created_at=datetime.now(),
+                # naive UTCで統一(日付判定はUTC解釈のため。models.utcnow_naive参照)
+                created_at=utcnow_naive(),
+                word_timestamps_json=word_ts,
+                word_timestamps_original_json=word_ts_original,
             )
             db.add(record)
             db.flush()

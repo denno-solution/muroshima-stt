@@ -29,6 +29,7 @@ from models import (
 from sqlalchemy import text as sql_text
 
 from services.rag import chunk_text
+from services.rag.chunk_timing import assign_chunk_times, select_timing_words
 from services.rag.context_builder import ContextDoc, build_context_docs
 from services.rag.date_utils import DateRange, parse_date_from_query
 from services.rag.prompt_builder import build_chat_messages
@@ -137,12 +138,15 @@ class RAGService:
             logger.warning("RAG: 埋め込み生成に失敗したためスキップ (%s id=%s)", source, transcription_id)
             return False
 
-        # recorded_dateの補完(ORMロードは不正JSON列で失敗しうるため生SQL)
+        # recorded_dateの補完と単語タイムスタンプの取得
+        # (ORMロードは不正JSON列で失敗しうるため生SQL)
         parent_table = "audio_transcriptions" if source == "audio" else "ceo_transcriptions"
         date_source_col = "recorded_at" if source == "ceo" else "created_at"
         row = db.execute(
             sql_text(
-                f"SELECT recorded_date, {date_source_col}, created_at FROM {parent_table} WHERE id = :id"
+                f"SELECT recorded_date, {date_source_col}, created_at, "
+                f"word_timestamps_json, word_timestamps_original_json "
+                f"FROM {parent_table} WHERE id = :id"
             ),
             {"id": transcription_id},
         ).first()
@@ -157,6 +161,25 @@ class RAGService:
                 {"d": recorded_date, "id": transcription_id},
             )
 
+        # チャンクへの録音内時刻割り当て(単語タイムスタンプがある録音のみ)。
+        # デスクトップ版保存分(word_timestamps_jsonあり)も再同期経由でここを通る。
+        time_basis: Optional[str] = None
+        chunk_times: List[Tuple[Optional[float], Optional[float]]] = [(None, None)] * len(chunks)
+        if row is not None:
+            try:
+                timing_words, time_basis = select_timing_words(row[3], row[4])
+                if timing_words:
+                    chunk_times = assign_chunk_times(
+                        text, chunks, timing_words, chunk_overlap=DEFAULT_CHUNK_OVERLAP
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "チャンク時刻の割り当てに失敗したため時刻なしで索引します (%s id=%s): %s",
+                    source, transcription_id, exc,
+                )
+                time_basis = None
+                chunk_times = [(None, None)] * len(chunks)
+
         # 既存チャンク+FTS行を削除してから再作成
         old_ids = [
             r[0]
@@ -168,11 +191,15 @@ class RAGService:
 
         new_chunks = []
         for idx, (piece, embedding) in enumerate(zip(chunks, embeddings)):
+            start_sec, end_sec = chunk_times[idx] if idx < len(chunk_times) else (None, None)
             chunk = chunk_model(
                 transcription_id=transcription_id,
                 chunk_index=idx,
                 chunk_text=piece,
                 embedding=embedding,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                time_basis=time_basis if start_sec is not None else None,
             )
             db.add(chunk)
             new_chunks.append(chunk)

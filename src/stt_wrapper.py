@@ -1,8 +1,9 @@
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 import importlib.util
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 # .envファイルを読み込む
@@ -10,6 +11,20 @@ load_dotenv()
 
 # スクリプトディレクトリをPythonパスに追加
 sys.path.append(str(Path(__file__).parent.parent / "scripts"))
+
+
+@dataclass
+class STTResult:
+    """文字起こし結果(単語タイムスタンプ付き)。
+
+    words は {text, start, end, type, speaker_id?} の配列(秒、STT入力音声基準)。
+    単語タイムスタンプ非対応のモデルでは None。
+    """
+
+    text: Optional[str]
+    words: Optional[List[Dict[str, Any]]] = None
+    error: Optional[str] = None
+
 
 class STTModelWrapper:
     """各STTモデルスクリプトを統一インターフェースで扱うラッパークラス"""
@@ -45,6 +60,28 @@ class STTModelWrapper:
             return result
         else:
             raise AttributeError(f"{self.module_name} does not have transcribe_audio_file function")
+
+    def transcribe_detailed(self, audio_file_path: str) -> STTResult:
+        """文字起こし+単語タイムスタンプ取得(対応モデルのみ)。
+
+        `transcribe_audio_file_detailed` を持つモジュール(現状 ElevenLabs)は
+        単語タイムスタンプ付きで返す。それ以外は従来の transcribe() の結果を
+        words=None で包む(後方互換)。
+        """
+        if hasattr(self.module, "transcribe_audio_file_detailed"):
+            detailed = self.module.transcribe_audio_file_detailed(audio_file_path)
+            if isinstance(detailed, dict):
+                return STTResult(
+                    text=detailed.get("text"),
+                    words=detailed.get("words") or None,
+                    error=detailed.get("error"),
+                )
+
+        result = self.transcribe(audio_file_path)
+        if isinstance(result, tuple) and result[0] is None:
+            error = result[1] if len(result) > 1 else "STT failed"
+            return STTResult(text=None, words=None, error=error)
+        return STTResult(text=result, words=None, error=None)
     
     @classmethod
     def get_available_models(cls) -> list:

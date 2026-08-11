@@ -10,18 +10,17 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from models import RAG_FTS_TABLES
+from services.rag.date_utils import JST  # noqa: F401  (後方互換の再エクスポート)
 from services.rag.tokenizer import to_fts_text
 
 logger = logging.getLogger(__name__)
-
-JST = timezone(timedelta(hours=9), name="JST")
 
 # 小数秒が6桁を超えるとdatetime.fromisoformatが失敗するため丸める
 _FRACTION_RE = re.compile(r"(\.\d{1,6})\d*")
