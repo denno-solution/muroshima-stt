@@ -1,11 +1,11 @@
 import os
 import tempfile
-from datetime import datetime
 import streamlit as st
 
-from models import AudioTranscription, get_db
+from models import AudioTranscription, get_db, utcnow_naive
 from stt_wrapper import STTModelWrapper
 from text_structurer import TextStructurer
+from services.word_timestamps import build_word_timestamp_columns
 
 from pathlib import Path
 from services.audio_utils import (
@@ -84,7 +84,9 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
             duration = get_audio_duration(tmp_path)
         # ローカルへ永続保存（必要なら）
         final_path: str | None = None
-        timestamp = datetime.now()
+        # created_at・ファイル名ともnaive UTCで統一(本番サーバーはUTC。
+        # JSTマシンで動かしても日付判定(UTC解釈)とズレないようにする)
+        timestamp = utcnow_naive()
         file_extension = ".wav" if tmp_path.endswith('.wav') else ".webm"
         final_filename = f"mic_{timestamp.strftime('%Y%m%d_%H%M%S')}{file_extension}"
         if save_local:
@@ -112,12 +114,16 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
             use_vad = bool(getattr(app_settings, "get_use_vad", lambda: True)())
             vad_aggr = int(getattr(app_settings, "get_vad_aggressiveness", lambda: 2)())
             stt_input_path = tmp_path
+            vad_applied = False  # STT入力がVADトリム後音声か
+            vad_kept_ranges = None
             if use_vad:
                 try:
                     from services.vad import trim_non_speech
 
                     vad_res = trim_non_speech(tmp_path, enabled=True, aggressiveness=vad_aggr)
                     stt_input_path = vad_res.output_path
+                    vad_applied = True
+                    vad_kept_ranges = vad_res.kept_ranges
                     reduced = 0.0
                     if vad_res.orig_sec > 0:
                         reduced = max(0.0, 1.0 - (vad_res.out_sec / vad_res.orig_sec)) * 100.0
@@ -127,10 +133,10 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                     logger.warning(f"VAD前処理に失敗したためスキップ: {e}")
                     st.warning("VAD前処理に失敗したため、元音声を使用します。")
 
-            transcription = stt_wrapper.transcribe(stt_input_path)
-            error_msg = None
-            if isinstance(transcription, tuple) and transcription[0] is None:
-                error_msg = transcription[1]
+            stt_result = stt_wrapper.transcribe_detailed(stt_input_path)
+            transcription = stt_result.text
+            error_msg = stt_result.error
+            if error_msg:
                 transcription = None
                 logger.error(f"マイク録音文字起こしエラー: {error_msg}")
 
@@ -191,6 +197,13 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
 
                 st.session_state.transcriptions.append(result)
 
+                # 単語タイムスタンプ(VAD後基準と元音声基準の両方)
+                word_ts, word_ts_original = build_word_timestamp_columns(
+                    stt_result.words,
+                    vad_applied=vad_applied,
+                    vad_ranges=vad_kept_ranges,
+                )
+
                 db = next(get_db())
                 try:
                     audio_record = AudioTranscription(
@@ -200,6 +213,8 @@ def run_mic_tab(selected_model: str, use_structuring: bool, logger):
                         transcript=transcription,
                         structured_json=structured_data,
                         tags=tags,
+                        word_timestamps_json=word_ts,
+                        word_timestamps_original_json=word_ts_original,
                     )
                     db.add(audio_record)
                     db.flush()

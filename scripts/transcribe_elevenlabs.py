@@ -61,15 +61,39 @@ def _clean_transcript(text: str) -> str:
     return out
 
 
-def transcribe_audio_file(audio_file_path, language_code=None):
-    """ElevenLabs Scribeで音声ファイルを文字起こしする
-    
-    Args:
-        audio_file_path: 音声ファイルのパス
-        language_code: 言語コード (例: "ja", "en") - Noneの場合は自動検出
-    
+def _extract_words(result) -> "list[dict] | None":
+    """APIレスポンスから単語タイムスタンプを取り出す。
+
+    stt-desktop が `word_timestamps_json` に保存するのと同じ
+    「単語オブジェクトの配列」形式({text, start, end, type, speaker_id?})。
+    characters(文字単位詳細)とlogprobはサイズ削減のため保存しない。
+    """
+    words = getattr(result, "words", None)
+    if not words:
+        return None
+    out: list[dict] = []
+    for w in words:
+        item: dict = {"text": getattr(w, "text", "") or ""}
+        for key in ("start", "end"):
+            value = getattr(w, key, None)
+            if isinstance(value, (int, float)):
+                item[key] = float(value)
+        word_type = getattr(w, "type", None)
+        if word_type:
+            item["type"] = str(word_type)
+        speaker_id = getattr(w, "speaker_id", None)
+        if speaker_id:
+            item["speaker_id"] = str(speaker_id)
+        out.append(item)
+    return out or None
+
+
+def transcribe_audio_file_detailed(audio_file_path, language_code=None):
+    """ElevenLabs Scribeで文字起こしし、単語タイムスタンプ付きで返す。
+
     Returns:
-        文字起こし結果のテキスト または (None, エラーメッセージ) のタプル
+        {"text": str|None, "words": list[dict]|None, "error": str|None}
+        words の各要素は {text, start, end, type, speaker_id?}(秒、STT入力音声基準)。
     """
     logger.info(f"処理開始: {audio_file_path}")
     logger.debug(f"ファイルパス: {audio_file_path}, 言語コード: {language_code}")
@@ -125,25 +149,48 @@ def transcribe_audio_file(audio_file_path, language_code=None):
         except Exception:
             pass
 
+        try:
+            words = _extract_words(result)
+            if words:
+                logger.debug(f"単語タイムスタンプ: {len(words)}要素")
+        except Exception as e:
+            logger.warning(f"単語タイムスタンプの抽出に失敗（本文のみ返却）: {e}")
+            words = None
+
         if result.text:
             cleaned = _clean_transcript(result.text)
             logger.info(f"文字起こし成功: {len(cleaned)}文字")
-            return cleaned
+            return {"text": cleaned, "words": words, "error": None}
         else:
             # 結果が複数のセグメントに分かれている場合
             if hasattr(result, 'segments'):
                 transcription = " ".join([getattr(segment, "text", "") for segment in result.segments]).strip()
                 cleaned = _clean_transcript(transcription)
                 logger.info(f"文字起こし成功（セグメント結合）: {len(cleaned)}文字")
-                return cleaned
+                return {"text": cleaned, "words": words, "error": None}
             logger.warning("文字起こし結果が空です")
-            return None
-            
+            return {"text": None, "words": None, "error": None}
+
     except Exception as e:
         error_msg = f"{audio_file_path} の処理中にエラーが発生しました: {type(e).__name__}: {str(e)}"
         logger.error(error_msg, exc_info=True)
-        # エラー情報を含むタプルを返す
-        return (None, error_msg)
+        return {"text": None, "words": None, "error": error_msg}
+
+
+def transcribe_audio_file(audio_file_path, language_code=None):
+    """ElevenLabs Scribeで音声ファイルを文字起こしする（従来互換）
+
+    Args:
+        audio_file_path: 音声ファイルのパス
+        language_code: 言語コード (例: "ja", "en") - Noneの場合は自動検出
+
+    Returns:
+        文字起こし結果のテキスト または (None, エラーメッセージ) のタプル
+    """
+    detailed = transcribe_audio_file_detailed(audio_file_path, language_code)
+    if detailed["error"]:
+        return (None, detailed["error"])
+    return detailed["text"]
 
 def save_transcription(filename, transcription, output_dir):
     """文字起こし結果をテキストファイルとして保存"""

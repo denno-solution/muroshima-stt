@@ -2,7 +2,7 @@ import logging
 import time
 import os
 from array import array
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 from dotenv import load_dotenv
@@ -23,7 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import deferred, relationship, sessionmaker
 from sqlalchemy.types import UserDefinedType
 
 # Postgres(pgvector)対応は廃止。libSQL専用。
@@ -36,6 +36,19 @@ logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+
+
+def utcnow_naive() -> datetime:
+    """UTC現在時刻をnaiveで返す(created_at列の書き込み用)。
+
+    created_at はDB全体で「naive UTC」に統一する。デスクトップ版はUTCの
+    RFC3339文字列を書き込んでおり、日付判定(services/rag/reconcile.py の
+    normalize_to_jst_date)はnaive値をUTCとして解釈する。bare datetime.now()
+    だとサーバーのローカルTZに依存し、JSTマシンで動かすと9時間ズレるため、
+    必ずこの関数を使う。aware値を書くとSQLiteの文字列形式が変わり
+    デスクトップ版との互換性に影響するため、naiveへ落とす。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _is_libsql(url: str) -> bool:
@@ -80,8 +93,8 @@ class AudioTranscription(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     file_path = Column(String(500), nullable=False)
-    created_at = Column(DateTime, nullable=False, default=datetime.now)
-    # 正規化済みの録音日(JST, 'YYYY-MM-DD')。created_atはWeb版(naive JST)と
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    # 正規化済みの録音日(JST, 'YYYY-MM-DD')。created_atはWeb版(naive UTC)と
     # デスクトップ版(UTC RFC3339)で形式が異なるため、検索はこの列で行う。
     recorded_date = Column(String(10), nullable=True, index=True)
     duration_seconds = Column(Float, nullable=False)
@@ -90,6 +103,12 @@ class AudioTranscription(Base):
     tags = Column(String(200), nullable=True)
     model_id = Column(String(100), nullable=True)
     language_code = Column(String(10), nullable=True)
+    # 単語タイムスタンプ({text, start, end, type, speaker_id?}の配列)。
+    # stt-desktop と同名・同形式。_json はSTTが返したまま(VAD後音声基準)、
+    # _original_json はVAD前=元音声基準へ復元した値。サイズが大きいため
+    # 通常のSELECTでは読み込まない(deferred)。
+    word_timestamps_json = deferred(Column(JSON, nullable=True))
+    word_timestamps_original_json = deferred(Column(JSON, nullable=True))
     chunks = relationship(
         "AudioTranscriptionChunk",
         back_populates="transcription",
@@ -124,7 +143,10 @@ class CeoTranscription(Base):
     structured_json = Column(JSON, nullable=True)
     duration_seconds = Column(Float, nullable=True)
     tags = Column(String(200), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    # 単語タイムスタンプ(audio_transcriptionsと同形式)
+    word_timestamps_json = deferred(Column(JSON, nullable=True))
+    word_timestamps_original_json = deferred(Column(JSON, nullable=True))
 
     def __repr__(self):
         return f"<CeoTranscription(id={self.id}, title={self.title})>"
@@ -213,12 +235,18 @@ class AudioTranscriptionChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     chunk_text = Column(Text, nullable=False)
+    # チャンクの録音内時刻範囲(秒)。time_basisは時刻の基準:
+    # "original"=VAD前の元音声基準 / "vad"=VAD後音声基準(元音声とズレの可能性)。
+    # 単語タイムスタンプが無い録音ではNULL(従来動作)。
+    start_sec = Column(Float, nullable=True)
+    end_sec = Column(Float, nullable=True)
+    time_basis = Column(String(16), nullable=True)
     if VECTOR_BACKEND == "libsql":
         embedding = Column(LibSQLF32Vector(EMBEDDING_DIM), nullable=False)
     else:
         # ローカルSQLite（非libSQL）の場合はRAG無効のためJSONで可
         embedding = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
 
     transcription = relationship("AudioTranscription", back_populates="chunks")
 
@@ -236,11 +264,15 @@ class CeoTranscriptionChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     chunk_text = Column(Text, nullable=False)
+    # audio_transcription_chunks と同じ時刻範囲カラム
+    start_sec = Column(Float, nullable=True)
+    end_sec = Column(Float, nullable=True)
+    time_basis = Column(String(16), nullable=True)
     if VECTOR_BACKEND == "libsql":
         embedding = Column(LibSQLF32Vector(EMBEDDING_DIM), nullable=False)
     else:
         embedding = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
 
 
 class RAGChatLog(Base):
@@ -249,7 +281,7 @@ class RAGChatLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(36), nullable=True, index=True)  # セッション管理用UUID
     chat_kind = Column(String(20), nullable=True)  # "audio"(現場録音) / "ceo"(社長音声)。NULLは旧データ=audio扱い
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
     user_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=True)
     contexts = Column(JSON, nullable=True)  # 参照したチャンクやスコアを保持
@@ -269,8 +301,21 @@ def _tolerant_json_loads(value):
         return None
 
 
+def _compact_json_dumps(value) -> str:
+    """JSON列の書き込み。word_timestamps_json のような大きい配列で
+    ASCIIエスケープ(\\uXXXX)がサイズを数倍にするため、UTF-8のまま
+    コンパクトに書く(デスクトップ版 serde_json と同じ方針)。"""
+    import json as _json
+
+    return _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 # データベース接続設定
-engine_kwargs = dict(echo=False, json_deserializer=_tolerant_json_loads)
+engine_kwargs = dict(
+    echo=False,
+    json_deserializer=_tolerant_json_loads,
+    json_serializer=_compact_json_dumps,
+)
 if IS_LIBSQL:
     engine_kwargs["pool_pre_ping"] = True
 
@@ -326,7 +371,16 @@ def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
         logger.warning("%s のカラム追加に失敗: %s", table_name, exc)
 
 
-_ensure_columns("audio_transcriptions", {"recorded_date": "TEXT"})
+_ensure_columns(
+    "audio_transcriptions",
+    {
+        "recorded_date": "TEXT",
+        # 単語タイムスタンプ(stt-desktop の ensure_tables と同名・同形式。
+        # desktop側で作成済みのDBでは既存カラムのため何もしない=冪等)
+        "word_timestamps_json": "TEXT",
+        "word_timestamps_original_json": "TEXT",
+    },
+)
 
 _ensure_columns("rag_chat_logs", {"chat_kind": "TEXT"})
 
@@ -352,8 +406,21 @@ _ensure_columns(
         "duration_seconds": "REAL",
         "tags": "TEXT",
         "created_at": "TEXT",
+        "word_timestamps_json": "TEXT",
+        "word_timestamps_original_json": "TEXT",
     },
 )
+
+# RAGチャンクの録音内時刻範囲(発言単位タイムスタンプのRAG利用)
+for _chunk_table in ("audio_transcription_chunks", "ceo_transcription_chunks"):
+    _ensure_columns(
+        _chunk_table,
+        {
+            "start_sec": "REAL",
+            "end_sec": "REAL",
+            "time_basis": "TEXT",
+        },
+    )
 
 # セッション作成
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

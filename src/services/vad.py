@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class VadTimeRange:
+    """VADで保持した区間の対応関係（元音声の時刻 ⇔ トリム後音声の時刻）。
+
+    stt-desktop の VadTimeRange (src-tauri/src/transcript.rs) と同じ意味。
+    STTが返すトリム後基準のタイムスタンプを元音声基準へ復元するために使う。
+    """
+
+    original_start: float
+    original_end: float
+    trimmed_start: float
+    trimmed_end: float
+
+
+@dataclass
 class VADResult:
     applied: bool
     method: str
@@ -22,6 +36,16 @@ class VADResult:
     output_path: str
     orig_sec: float
     out_sec: float
+    # 出力(トリム後)音声を構成する保持区間。トリムなし・フォールバック時は
+    # 全区間1件(恒等変換)。復元不能な場合のみNone。
+    kept_ranges: Optional[List[VadTimeRange]] = None
+
+
+def _identity_ranges(duration_sec: float) -> List[VadTimeRange]:
+    """出力=元音声(無変換)の場合の恒等区間。"""
+    if duration_sec <= 0:
+        return []
+    return [VadTimeRange(0.0, duration_sec, 0.0, duration_sec)]
 
 
 def _to_int16_pcm(x: np.ndarray) -> np.ndarray:
@@ -29,21 +53,31 @@ def _to_int16_pcm(x: np.ndarray) -> np.ndarray:
     return (x * 32767.0).astype(np.int16)
 
 
-def _energy_trim(audio: np.ndarray, sr: int, top_db: int = 30, pad_ms: int = 150) -> Tuple[np.ndarray, float]:
+def _energy_trim(
+    audio: np.ndarray, sr: int, top_db: int = 30, pad_ms: int = 150
+) -> Tuple[np.ndarray, float, List[VadTimeRange]]:
     """librosaのエネルギーベースで非音声（無音）をカットする簡易版。
     webrtcvadが使えない環境のフォールバックとして使用。
     """
     intervals = librosa.effects.split(audio, top_db=top_db)
     if intervals.size == 0:
-        return audio, float(len(audio) / sr)
+        dur = float(len(audio) / sr)
+        return audio, dur, _identity_ranges(dur)
     pad = int(sr * pad_ms / 1000)
     pieces: List[np.ndarray] = []
+    ranges: List[VadTimeRange] = []
+    cum = 0.0
     for start, end in intervals:
         s = max(0, start - pad)
         e = min(len(audio), end + pad)
-        pieces.append(audio[s:e])
+        piece = audio[s:e]
+        piece_sec = float(len(piece) / sr)
+        if piece_sec > 0:
+            ranges.append(VadTimeRange(s / sr, e / sr, cum, cum + piece_sec))
+            cum += piece_sec
+        pieces.append(piece)
     out = np.concatenate(pieces) if pieces else audio
-    return out, float(len(out) / sr)
+    return out, float(len(out) / sr), ranges
 
 
 def trim_non_speech(
@@ -77,7 +111,8 @@ def trim_non_speech(
         # 変換のみ: STTの互換性を維持するため16kHzに変換して保存
         audio_16k = librosa.resample(orig_audio, orig_sr=orig_sr, target_sr=target_sr) if orig_sr != target_sr else orig_audio
         sf.write(out_path, audio_16k, target_sr)
-        return VADResult(False, "none", input_path, out_path, orig_sec, float(len(audio_16k)/target_sr))
+        out_sec = float(len(audio_16k) / target_sr)
+        return VADResult(False, "none", input_path, out_path, orig_sec, out_sec, _identity_ranges(out_sec))
 
     try:
         import webrtcvad  # type: ignore
@@ -95,7 +130,8 @@ def trim_non_speech(
         if n_frames == 0:
             # きわめて短いファイルはスルー
             sf.write(out_path, audio_16k, target_sr)
-            return VADResult(True, "webrtcvad", input_path, out_path, orig_sec, float(len(audio_16k)/target_sr))
+            out_sec = float(len(audio_16k) / target_sr)
+            return VADResult(True, "webrtcvad", input_path, out_path, orig_sec, out_sec, _identity_ranges(out_sec))
 
         speech_flags = []
         for i in range(n_frames):
@@ -133,7 +169,8 @@ def trim_non_speech(
         if not segments:
             # すべて非音声と判定された場合は原音を書き出す
             sf.write(out_path, audio_16k, target_sr)
-            return VADResult(True, "webrtcvad_empty", input_path, out_path, orig_sec, float(len(audio_16k)/target_sr))
+            out_sec = float(len(audio_16k) / target_sr)
+            return VADResult(True, "webrtcvad_empty", input_path, out_path, orig_sec, out_sec, _identity_ranges(out_sec))
 
         pieces = [audio_16k[s:e] for s, e in segments]
         trimmed = np.concatenate(pieces) if pieces else audio_16k
@@ -142,21 +179,35 @@ def trim_non_speech(
         # 短すぎるとSTTが不安定になるのでフォールバック
         if out_sec * 1000 < min_out_ms:
             sf.write(out_path, audio_16k, target_sr)
-            return VADResult(True, "webrtcvad_short_fallback", input_path, out_path, orig_sec, float(len(audio_16k)/target_sr))
+            full_sec = float(len(audio_16k) / target_sr)
+            return VADResult(True, "webrtcvad_short_fallback", input_path, out_path, orig_sec, full_sec, _identity_ranges(full_sec))
+
+        # 保持区間(元音声時刻⇔トリム後時刻)を記録する
+        kept_ranges: List[VadTimeRange] = []
+        cum = 0.0
+        for s, e in segments:
+            piece_sec = float((e - s) / target_sr)
+            if piece_sec <= 0:
+                continue
+            kept_ranges.append(
+                VadTimeRange(s / target_sr, e / target_sr, cum, cum + piece_sec)
+            )
+            cum += piece_sec
 
         sf.write(out_path, trimmed, target_sr)
-        return VADResult(True, "webrtcvad", input_path, out_path, orig_sec, out_sec)
+        return VADResult(True, "webrtcvad", input_path, out_path, orig_sec, out_sec, kept_ranges)
 
     except Exception as e:
         logger.warning(f"webrtcvadが使用できないためエネルギートリムにフォールバックします: {e}")
         # フォールバック（エネルギーベース）
         audio_16k = librosa.resample(orig_audio, orig_sr=orig_sr, target_sr=target_sr) if orig_sr != target_sr else orig_audio
-        trimmed, out_sec = _energy_trim(audio_16k, target_sr, top_db=30, pad_ms=pad_ms)
+        trimmed, out_sec, kept_ranges = _energy_trim(audio_16k, target_sr, top_db=30, pad_ms=pad_ms)
         if out_sec * 1000 < min_out_ms:
             trimmed = audio_16k
             out_sec = float(len(trimmed) / target_sr)
             method = "energy_short_fallback"
+            kept_ranges = _identity_ranges(out_sec)
         else:
             method = "energy"
         sf.write(out_path, trimmed, target_sr)
-        return VADResult(True, method, input_path, out_path, orig_sec, out_sec)
+        return VADResult(True, method, input_path, out_path, orig_sec, out_sec, kept_ranges)
