@@ -3,23 +3,38 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 from services.rag.context_builder import ContextDoc
 from services.rag.date_utils import jst_today
 
-_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
+_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声", "work": "業務記録"}
 
 
 _CORPUS_DESCRIPTIONS = {
     "audio": "現場の作業録音を文字起こしした「音声DB」",
     "ceo": "社長が録音した音声メモ・打ち合わせを文字起こしした「社長音声DB」",
+    "work": "業務内容を録音した「業務記録」",
 }
 
+# corpusはソースキー1つ(str)または複数(検索ソースの組)を受け取る
+Corpus = Union[str, Sequence[str]]
 
-def build_system_prompt(today: Optional[date] = None, corpus: str = "audio") -> str:
+
+def _corpus_description(corpus: Corpus) -> str:
+    """検索対象ソースの説明文。複数ソース検索時は「、」で並べる。"""
+    keys = [corpus] if isinstance(corpus, str) else list(corpus)
+    descs: List[str] = []
+    for key in keys:
+        desc = _CORPUS_DESCRIPTIONS.get(key)
+        if desc and desc not in descs:
+            descs.append(desc)
+    return "、".join(descs) or _CORPUS_DESCRIPTIONS["audio"]
+
+
+def build_system_prompt(today: Optional[date] = None, corpus: Corpus = "audio") -> str:
     today_str = (today or jst_today()).isoformat()
-    corpus_desc = _CORPUS_DESCRIPTIONS.get(corpus, _CORPUS_DESCRIPTIONS["audio"])
+    corpus_desc = _corpus_description(corpus)
     return (
         "あなたは射出成形工場の社内アシスタントです。"
         f"{corpus_desc}から検索した内容(コンテキスト)に基づいて質問に答えます。\n"
@@ -63,7 +78,7 @@ def build_chat_messages(
     docs: List[ContextDoc],
     chat_history: Optional[List[Dict]] = None,
     today: Optional[date] = None,
-    corpus: str = "audio",
+    corpus: Corpus = "audio",
     notes: Optional[List[str]] = None,
 ) -> List[Dict]:
     """回答生成用メッセージ列を組み立てる。

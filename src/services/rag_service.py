@@ -597,9 +597,8 @@ class RAGService:
         t1: float,
     ) -> Dict:
         """コンテキスト確定後の共通処理(プロンプト構築・ストリーム関数・メタ)。"""
-        corpus = "ceo" if tuple(plan.sources) == ("ceo",) else "audio"
         messages = build_chat_messages(
-            query, docs, chat_history, today, corpus=corpus, notes=notes or None
+            query, docs, chat_history, today, corpus=plan.sources, notes=notes or None
         )
         t2 = time.time()
 
