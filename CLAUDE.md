@@ -185,13 +185,13 @@ uv lock --upgrade
 - RAG機能は Turso(libSQL) 専用です（Postgres対応は削除）。
 - `.env` では必須の `OPENAI_API_KEY` に加え、必要に応じて `EMBEDDING_MODEL` (既定: text-embedding-3-large、dimensions=1536で格納), `EMBEDDING_DIM`, `RAG_COMPLETION_MODEL`, `ENABLE_RAG` を設定可能。
 - 新規保存分は自動でチャンク化・埋め込み登録。既存データをRAG対応させるには再保存やバックフィルスクリプトが必要。
-- Streamlit UIのQAチャットは「💬 現場録音に質問」「💬 社長音声に質問」の2タブに分離（検索エンジンは共通、検索対象・会話履歴・プロンプトが別）。
+- Streamlit UIのQAチャットは「💬 録音データに質問」の1タブ。検索対象はソース選択pills（現場録音/社長音声/業務記録、既定は全ソース）で切り替える。
 - Supabase関連の機能（Storage・移行ドキュメント等）は削除済みです。
 
 ## Agent Notes（RAG開発向けメモ）
 - 本リポジトリはデータベースをTurso(libSQL)に完全移行済み。Postgres/pgvector対応はコードから削除済みです。関連依存（psycopg2, pgvector）も`pyproject.toml`から除外しました。
-- QAチャット（「現場録音に質問」「社長音声に質問」タブ）のアーキテクチャ:
-  - 出口は現場録音用と社長音声用で分離（`ui/tabs/rag_tab.py`の`_ChatProfile`）。会話ログは`rag_chat_logs.chat_kind`（"audio"/"ceo"、NULLは旧データ=audio扱い）で区別
+- QAチャット（「録音データに質問」タブ）のアーキテクチャ:
+  - 出口は1タブ（`ui/tabs/rag_tab.py`）で、検索対象はソース選択pills（audio/ceo/work、既定は全ソース）。会話ログ`rag_chat_logs.chat_kind`はデスクトップ版と同じ規則で記録（現場録音を含む検索="audio" / 含まない="ceo"、NULLは旧データ=audio扱い。参照ソースは`contexts[].source`に残る）
   - 新規保存分は保存時に即時索引化（現場録音: upload_tab/mic_tab、社長音声: ceo_processor）。デスクトップ版等の外部保存分はQAタブ表示時に自動取り込み（20件以下は自動、超過時はボタン表示）
   - 検索モードは3種: `search`（ハイブリッド検索）/ `browse`（期間・要約だけが手がかりの質問。新しい順に最大`RAG_AGGREGATE_MAX_DOCS`=30件を薄く読む）/ `followup`（形式変更・メタ質問。再検索せず前回の参照録音を再利用）
   - `services/rag/query_cleaner.py`: 検索計画の判断材料（指示語除去・内容語判定・集約/追問判定・STT表記ゆれ同義語辞書）。同義語はprodコーパス走査で実在確認したもののみ登録（ヒケ=引け、ソリ=反り等）。指示語バイグラムはBM25を汚染するためFTSクエリから除外する（実測nDCG@6 0.47→0.64）
