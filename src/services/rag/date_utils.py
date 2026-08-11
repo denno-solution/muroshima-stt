@@ -8,11 +8,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 # 「最近」の既定ウィンドウ(日)
 RECENCY_DAYS = 30
+
+JST = timezone(timedelta(hours=9), name="JST")
+
+
+def jst_today() -> date:
+    """JSTでの「今日」。
+
+    サーバー(Streamlit Community Cloud)はUTCで動くため、bare date.today()だと
+    JST 0時〜9時の間は前日になる。「今日」「昨日」等の相対日付判定と
+    プロンプトの今日日付には必ずこちらを使う。
+    """
+    return datetime.now(JST).date()
 
 
 @dataclass(frozen=True)
@@ -116,8 +128,11 @@ def _parse_date_range_expr(q: str, today: date) -> Optional[DateRange]:
 
 
 def parse_date_from_query(query: str, today: Optional[date] = None) -> Optional[DateRange]:
-    """クエリから日付範囲を抽出する。より具体的な表現を優先する。"""
-    today = today or date.today()
+    """クエリから日付範囲を抽出する。より具体的な表現を優先する。
+
+    todayを省略した場合はJSTの今日を使う(サーバーローカルではない)。
+    """
+    today = today or jst_today()
     q = query or ""
 
     # --- 範囲表現 (2025/1/01～2025/01/16 / 7月1日から7月15日まで) ---

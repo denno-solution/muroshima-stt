@@ -17,6 +17,7 @@ from sqlalchemy import func, or_
 
 from models import RAGChatLog, USE_VECTOR, get_db
 from services.rag import highlight_date_in_query
+from services.rag.date_utils import jst_today
 from services.rag_service import get_rag_service
 
 logger = logging.getLogger(__name__)
@@ -426,6 +427,9 @@ def _run_chat(profile: _ChatProfile):
                 manual_date_range=manual_range,
                 chat_history=chat_history_for_rag,
                 previous_docs=previous_docs,
+                # サーバーはUTCのため、「今日」「昨日」等の判定と
+                # プロンプトの今日日付にはJSTの今日を明示的に渡す
+                today=jst_today(),
             )
         except Exception as e:
             _handle_rag_error(e, "検索実行")
