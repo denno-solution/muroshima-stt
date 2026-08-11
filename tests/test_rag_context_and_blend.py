@@ -72,16 +72,44 @@ def mini_db():
         ))
         c.execute(text(
             "CREATE TABLE audio_transcription_chunks ("
-            "id INTEGER PRIMARY KEY, transcription_id INTEGER, chunk_index INTEGER, chunk_text TEXT)"
+            "id INTEGER PRIMARY KEY, transcription_id INTEGER, chunk_index INTEGER, chunk_text TEXT, "
+            "start_sec REAL, end_sec REAL, time_basis TEXT)"
         ))
         c.execute(text("INSERT INTO audio_transcriptions VALUES (1, '短い録音の全文です。')"))
         long_text = "長い録音。" * 2000  # 10000文字
         c.execute(text("INSERT INTO audio_transcriptions VALUES (2, :t)"), {"t": long_text})
         for i in range(5):
             c.execute(
-                text("INSERT INTO audio_transcription_chunks VALUES (:id, 2, :idx, :t)"),
+                text(
+                    "INSERT INTO audio_transcription_chunks VALUES "
+                    "(:id, 2, :idx, :t, NULL, NULL, NULL)"
+                ),
                 {"id": 100 + i, "idx": i, "t": f"チャンク{i}の本文。" * 10},
             )
+        # id=3: 時刻付きチャンクを持つ長い録音(タイムスタンプ表示のテスト用)
+        c.execute(text("INSERT INTO audio_transcriptions VALUES (3, :t)"), {"t": "時刻付き。" * 1000})
+        for i in range(5):
+            c.execute(
+                text(
+                    "INSERT INTO audio_transcription_chunks VALUES "
+                    "(:id, 3, :idx, :t, :s, :e, 'original')"
+                ),
+                {
+                    "id": 200 + i,
+                    "idx": i,
+                    "t": f"時刻チャンク{i}の本文。" * 10,
+                    "s": i * 60.0,
+                    "e": i * 60.0 + 55.0,
+                },
+            )
+        # id=4: 時刻付きチャンクを持つ短い録音(全文表示でも時刻ラベルが付く)
+        c.execute(text("INSERT INTO audio_transcriptions VALUES (4, '短い時刻付き録音です。続きの文です。')"))
+        c.execute(
+            text(
+                "INSERT INTO audio_transcription_chunks VALUES "
+                "(300, 4, 0, '短い時刻付き録音です。続きの文です。', 12.0, 34.0, 'vad')"
+            )
+        )
     Session = sessionmaker(bind=engine)
     db = Session()
     yield db
@@ -171,6 +199,64 @@ class TestNormalizeToJstDate:
         assert normalize_to_jst_date(None) is None
         assert normalize_to_jst_date("") is None
         assert normalize_to_jst_date("not a date") is None
+
+
+class TestTimedContext:
+    """チャンク時刻(start_sec/end_sec)がある録音の [MM:SS〜MM:SS] 表示。"""
+
+    def test_format_mmss(self):
+        from services.rag.context_builder import _format_mmss
+
+        assert _format_mmss(0) == "00:00"
+        assert _format_mmss(75.4) == "01:15"
+        assert _format_mmss(3900) == "65:00"  # 60分超は分が2桁を超える
+
+    def test_excerpt_windows_have_time_labels(self, mini_db):
+        docs = build_context_docs(
+            mini_db, [_hit(3, 2, 0.8)], max_docs=3, max_chars=40000, whole_doc_threshold=4000
+        )
+        assert len(docs) == 1
+        d = docs[0]
+        assert not d.is_full_text
+        assert d.time_basis == "original"
+        # ヒット±1のチャンク(1,2,3)が時刻ラベル付きで含まれる
+        assert "[01:00〜01:55] 時刻チャンク1の本文。" in d.text
+        assert "[02:00〜02:55]" in d.text
+        assert "[00:00〜00:55]" not in d.text  # window外
+        assert "[04:00〜04:55]" not in d.text  # window外
+
+    def test_full_text_gets_time_labels(self, mini_db):
+        docs = build_context_docs(
+            mini_db, [_hit(4, 0, 0.9)], max_docs=3, max_chars=40000, whole_doc_threshold=4000
+        )
+        assert len(docs) == 1
+        d = docs[0]
+        assert d.is_full_text
+        assert d.time_basis == "vad"
+        assert d.text.startswith("[00:12〜00:34] 短い時刻付き録音です。")
+
+    def test_untimed_doc_unchanged(self, mini_db):
+        docs = build_context_docs(
+            mini_db, [_hit(2, 2, 0.8)], max_docs=3, max_chars=40000, whole_doc_threshold=4000
+        )
+        assert docs[0].time_basis is None
+        assert "[0" not in docs[0].text  # 時刻ラベルなし
+
+    def test_merge_timed_windows_overlap_and_gap(self):
+        from services.rag.context_builder import _ChunkRow, _merge_timed_chunk_windows
+
+        rows = [
+            _ChunkRow(0, "あいうえおかきくけこ", 0.0, 10.0, "original"),
+            _ChunkRow(1, "かきくけこさしすせそ", 5.0, 15.0, "original"),  # 前半5文字が重複
+            _ChunkRow(3, "離れたチャンク", 30.0, 40.0, "original"),
+        ]
+        out = _merge_timed_chunk_windows(rows, {0, 1, 3})
+        lines = out.split("\n")
+        assert lines[0] == "[00:00〜00:10] あいうえおかきくけこ"
+        # 重複5/10文字を除去し、開始時刻は線形補間で 5.0 + 10*0.5 = 10.0
+        assert lines[1] == "[00:10〜00:15] さしすせそ"
+        assert lines[2] == "（…中略…）"
+        assert lines[3] == "[00:30〜00:40] 離れたチャンク"
 
 
 class TestPerDocCap:

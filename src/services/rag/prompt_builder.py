@@ -6,6 +6,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 from services.rag.context_builder import ContextDoc
+from services.rag.date_utils import jst_today
 
 _SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
 
@@ -17,7 +18,7 @@ _CORPUS_DESCRIPTIONS = {
 
 
 def build_system_prompt(today: Optional[date] = None, corpus: str = "audio") -> str:
-    today_str = (today or date.today()).isoformat()
+    today_str = (today or jst_today()).isoformat()
     corpus_desc = _CORPUS_DESCRIPTIONS.get(corpus, _CORPUS_DESCRIPTIONS["audio"])
     return (
         "あなたは射出成形工場の社内アシスタントです。"
@@ -28,6 +29,7 @@ def build_system_prompt(today: Optional[date] = None, corpus: str = "audio") -> 
         "- コンテキストは音声の自動文字起こしのため、誤変換や言い淀みが含まれうる。文脈から明らかな誤変換は補って解釈してよいが、推測した場合はその旨を付記する\n"
         "- 回答の形式は質問の指定に従う(表形式・報告書形式など)。指定がなければ簡潔な箇条書き\n"
         "- 日付は YYYY-MM-DD 形式で明示する\n"
+        "- コンテキスト本文の [MM:SS〜MM:SS] は録音開始からの経過時間。発言時刻(録音内の経過時間)を引用する際は MM:SS 形式で明示する\n"
         "- コンテキストに根拠がない事項は推測せず、「記録には見つからない」と正直に述べる\n"
         "- 会話の文脈を維持し、直前のやり取りとの関連を保つ"
     )
@@ -44,6 +46,13 @@ def format_context_block(docs: List[ContextDoc]) -> str:
         meta_parts.append(_SOURCE_LABELS.get(d.source, d.source))
         if not d.is_full_text:
             meta_parts.append("※関連部分の抜粋")
+        if getattr(d, "time_basis", None) == "vad":
+            # 元音声基準(word_timestamps_original_json)が無い録音は
+            # 無音カット後の音声基準の時刻しか無いことを明示する
+            meta_parts.append(
+                "※録音内時刻は無音カット(VAD)後の音声基準のため、"
+                "元の録音の再生位置とはズレている可能性がある"
+            )
         header = f"[#{d.n}] " + " / ".join(meta_parts)
         blocks.append(f"{header}\n{d.text}")
     return "\n\n".join(blocks)
