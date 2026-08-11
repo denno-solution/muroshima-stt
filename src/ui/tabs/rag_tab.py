@@ -22,7 +22,7 @@ from services.rag_service import get_rag_service
 
 logger = logging.getLogger(__name__)
 
-_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声"}
+_SOURCE_LABELS = {"audio": "現場録音", "ceo": "社長音声", "work": "業務記録"}
 
 # 自動インデックスを黙って実行する上限(超える場合はボタンで明示実行)
 _AUTO_INDEX_LIMIT = 20
@@ -33,11 +33,14 @@ class _ChatProfile:
     """QAチャットの出口ごとの設定。現場録音と社長音声で会話・検索対象を分離する。"""
 
     key: str  # session_state・ウィジェットkey・chat_kindの識別子("audio"/"ceo")
-    sources: Tuple[str, ...]
+    sources: Tuple[str, ...]  # ソース選択の既定値(タブ内のpillsで変更可能)
     header: str
     placeholder: str
 
 
+# 既定では3ソース(現場録音・社長音声・業務記録)すべてがいずれかのタブの検索対象。
+# 業務記録はceo_transcriptionsにtags='業務記録'で保存されるため、社長音声タブの
+# 既定に含めることで従来の検索範囲(ceo_transcriptions全行)を維持する。
 _AUDIO_PROFILE = _ChatProfile(
     key="audio",
     sources=("audio",),
@@ -46,7 +49,7 @@ _AUDIO_PROFILE = _ChatProfile(
 )
 _CEO_PROFILE = _ChatProfile(
     key="ceo",
-    sources=("ceo",),
+    sources=("ceo", "work"),
     header="💬 社長音声に質問",
     placeholder="質問を入力（例: 最近の録音の内容をまとめて / 〇〇の件はどういう話だった？）",
 )
@@ -283,7 +286,7 @@ def _ensure_index(rag, profile: _ChatProfile, pending: Dict[str, int]) -> None:
     else:
         st.warning(
             f"⚠️ **{total}件の録音が検索インデックスに未登録です**"
-            f"（現場録音 {pending.get('audio', 0)}件 / 社長音声 {pending.get('ceo', 0)}件）。"
+            f"（現場録音 {pending.get('audio', 0)}件 / 社長音声・業務記録 {pending.get('ceo', 0)}件）。"
             "デスクトップ版で保存されたデータや、検索エンジンの更新"
             "（埋め込みモデル変更）による再作成分が該当します。"
             "インデックス化するまで、これらはキーワード・類似検索の対象になりません。"
@@ -331,12 +334,27 @@ def _run_chat(profile: _ChatProfile):
 
     # --- コーパス統計と索引状態 ---
     stats, pending = _corpus_snapshot()
-    src = profile.sources[0]
-    s = stats.get(src, {})
-    st.caption(
-        f"検索対象: {_SOURCE_LABELS[src]} **{s.get('count', 0)}件**"
-        f"（最新の録音日 {s.get('latest') or '—'}）"
+
+    # 検索ソース選択(既定はプロファイルごとの検索範囲。追加・除外できる)
+    selected = st.pills(
+        "検索ソース",
+        options=list(_SOURCE_LABELS),
+        format_func=_SOURCE_LABELS.get,
+        selection_mode="multi",
+        default=list(profile.sources),
+        key=f"rag_{profile.key}_sources",
+        label_visibility="collapsed",
     )
+    sel_sources = tuple(s for s in _SOURCE_LABELS if s in (selected or ()))
+    if sel_sources:
+        counts = " / ".join(
+            f"{_SOURCE_LABELS[s]} **{stats.get(s, {}).get('count', 0)}件**"
+            for s in sel_sources
+        )
+        latest = max(
+            (stats.get(s, {}).get("latest") or "" for s in sel_sources), default=""
+        )
+        st.caption(f"検索対象: {counts}（最新の録音日 {latest or '—'}）")
 
     _ensure_index(rag, profile, pending)
 
@@ -395,6 +413,10 @@ def _run_chat(profile: _ChatProfile):
                 with block.expander(f"参照した録音（{len(message['contexts'])}件）", expanded=False):
                     _render_context_docs(message["contexts"])
 
+    if not sel_sources:
+        st.info("検索ソースを1つ以上選択してください。")
+        return
+
     query = st.chat_input(profile.placeholder, key=f"rag_{profile.key}_chat_input")
     if not query:
         return
@@ -423,7 +445,7 @@ def _run_chat(profile: _ChatProfile):
             result = rag.answer_stream(
                 db,
                 query,
-                sources=profile.sources,
+                sources=sel_sources,
                 manual_date_range=manual_range,
                 chat_history=chat_history_for_rag,
                 previous_docs=previous_docs,

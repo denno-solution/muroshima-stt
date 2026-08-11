@@ -99,7 +99,9 @@ def main() -> None:
     parser.add_argument("query", nargs="?", help="質問文")
     parser.add_argument("--batch", help="1行1質問のテキストファイル")
     parser.add_argument("--from-logs", type=int, metavar="N", help="質問ログから直近N件を評価")
-    parser.add_argument("--sources", default="audio", help="audio / ceo / audio,ceo")
+    parser.add_argument(
+        "--sources", default="audio", help="audio / ceo / work をカンマ区切りで指定（例: audio,ceo,work）"
+    )
     args = parser.parse_args()
 
     rag = get_rag_service()

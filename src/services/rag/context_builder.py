@@ -19,6 +19,8 @@ from sqlalchemy.orm import Session
 _PARENT_TABLES = {
     "audio": ("audio_transcriptions", "audio_transcription_chunks"),
     "ceo": ("ceo_transcriptions", "ceo_transcription_chunks"),
+    # 業務記録(tags='業務記録')はceoと同じテーブルに保存される(検索時にタグで分岐済み)
+    "work": ("ceo_transcriptions", "ceo_transcription_chunks"),
 }
 
 

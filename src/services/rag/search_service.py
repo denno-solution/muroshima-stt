@@ -19,19 +19,36 @@ from sqlalchemy.orm import Session
 from models import RAG_FTS_TABLES
 from services.rag.tokenizer import fts_query_any
 
-# ソース種別ごとのテーブル定義
+# デスクトップ版(stt-desktop)が ceo_transcriptions.tags に書き込む業務記録タグ。
+# Web版のCEO処理(ceo_processor.py)は tags='社長音声' を書き、既存行は tags NULL。
+WORK_RECORD_TAG = "業務記録"
+
+# ソース種別ごとのテーブル定義。
+# "ceo"と"work"は物理テーブル(ceo_transcriptions / ceo_transcription_chunks /
+# rag_fts_ceo)を共有し、検索時に親テーブルの tags でソースを分岐する("where")。
+# 索引(チャンク・FTS)はタグに関わらず全行が対象のままでよく、再構築は不要。
 _SOURCES: Dict[str, Dict[str, str]] = {
     "audio": {
         "chunks": "audio_transcription_chunks",
         "parent": "audio_transcriptions",
         "fts": RAG_FTS_TABLES["audio"],
         "title": "trans.file_path",
+        "where": "",
     },
     "ceo": {
         "chunks": "ceo_transcription_chunks",
         "parent": "ceo_transcriptions",
         "fts": RAG_FTS_TABLES["ceo"],
         "title": "COALESCE(NULLIF(trans.title, ''), trans.file_path)",
+        # 既存行(tags NULL)は従来通り社長音声として検索されることを保証する
+        "where": f" AND (trans.tags IS NULL OR trans.tags != '{WORK_RECORD_TAG}')",
+    },
+    "work": {
+        "chunks": "ceo_transcription_chunks",
+        "parent": "ceo_transcriptions",
+        "fts": RAG_FTS_TABLES["ceo"],
+        "title": "COALESCE(NULLIF(trans.title, ''), trans.file_path)",
+        "where": f" AND trans.tags = '{WORK_RECORD_TAG}'",
     },
 }
 
@@ -141,7 +158,7 @@ class SearchService:
                 f"vector_distance_cos(chunk.embedding, vector32(:qvec)) AS distance "
                 f"FROM {cfg['chunks']} AS chunk "
                 f"JOIN {cfg['parent']} AS trans ON trans.id = chunk.transcription_id "
-                f"WHERE chunk.embedding IS NOT NULL{_DATE_WHERE} "
+                f"WHERE chunk.embedding IS NOT NULL{cfg['where']}{_DATE_WHERE} "
                 f"ORDER BY distance ASC LIMIT :k"
             )
             params = {"qvec": qvec, "k": k, **filters.date_params()}
@@ -166,7 +183,7 @@ class SearchService:
                 f"FROM {fts} "
                 f"JOIN {cfg['chunks']} AS chunk ON chunk.id = {fts}.rowid "
                 f"JOIN {cfg['parent']} AS trans ON trans.id = chunk.transcription_id "
-                f"WHERE {fts} MATCH :q{_DATE_WHERE} "
+                f"WHERE {fts} MATCH :q{cfg['where']}{_DATE_WHERE} "
                 f"ORDER BY bm25 LIMIT :k"
             )
             params = {"q": match_query, "k": k, **filters.date_params()}
@@ -210,7 +227,7 @@ class SearchService:
                 text(
                     f"SELECT COUNT(*) AS n FROM {cfg['parent']} AS trans "
                     f"WHERE trans.transcript IS NOT NULL AND trans.transcript != ''"
-                    f"{_DATE_WHERE}"
+                    f"{cfg['where']}{_DATE_WHERE}"
                 ),
                 filters.date_params(),
             ).mappings().first()
@@ -237,7 +254,8 @@ class SearchService:
                 f"trans.created_at AS recorded_at, trans.duration_seconds AS duration, "
                 f"'{source}' AS source "
                 f"FROM {cfg['parent']} AS trans "
-                f"WHERE trans.transcript IS NOT NULL AND trans.transcript != ''{_DATE_WHERE} "
+                f"WHERE trans.transcript IS NOT NULL AND trans.transcript != ''"
+                f"{cfg['where']}{_DATE_WHERE} "
                 f"ORDER BY trans.recorded_date DESC, trans.id DESC LIMIT :max_recs"
             )
             params = {"max_recs": max_recordings, **filters.date_params()}
@@ -259,8 +277,10 @@ class SearchService:
         for source, cfg in _SOURCES.items():
             row = db.execute(
                 text(
-                    f"SELECT COUNT(*) AS n, MAX(recorded_date) AS latest "
-                    f"FROM {cfg['parent']} WHERE transcript IS NOT NULL AND transcript != ''"
+                    f"SELECT COUNT(*) AS n, MAX(trans.recorded_date) AS latest "
+                    f"FROM {cfg['parent']} AS trans "
+                    f"WHERE trans.transcript IS NOT NULL AND trans.transcript != ''"
+                    f"{cfg['where']}"
                 )
             ).mappings().first()
             stats[source] = {"count": row["n"] if row else 0, "latest": row["latest"] if row else None}
@@ -273,7 +293,11 @@ class SearchService:
         for source in sources:
             cfg = _SOURCES[source]
             row = db.execute(
-                text(f"SELECT MIN(recorded_date) AS lo, MAX(recorded_date) AS hi FROM {cfg['parent']}")
+                text(
+                    f"SELECT MIN(trans.recorded_date) AS lo, MAX(trans.recorded_date) AS hi "
+                    f"FROM {cfg['parent']} AS trans "
+                    f"WHERE trans.recorded_date IS NOT NULL{cfg['where']}"
+                )
             ).mappings().first()
             if row and row["lo"]:
                 lo = min(lo, row["lo"]) if lo else row["lo"]
